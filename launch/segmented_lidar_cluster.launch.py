@@ -17,6 +17,15 @@ def generate_launch_description():
         parameters=[params_file],
     )
 
+    local_search = Node(
+        package="get_seg_3d_coord",
+        executable="local_search",
+        name="local_search",
+        output="screen",
+        parameters=[params_file],
+    )
+
     return LaunchDescription([
         table_person_association,
+        local_search,
     ])

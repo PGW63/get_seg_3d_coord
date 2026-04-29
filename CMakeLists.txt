@@ -22,8 +22,17 @@ find_package(tf2_ros REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(inha_interfaces REQUIRED)
 
+rosidl_get_typesupport_target(cpp_typesupport_target
+  ${PROJECT_NAME}
+  "rosidl_typesupport_cpp"
+)
+
 add_executable(table_person_association
   src/table_person_association.cpp
+)
+
+add_executable(local_search
+  src/local_search.cpp
 )
 
 target_include_directories(table_person_association
@@ -34,7 +43,16 @@ target_include_directories(table_person_association
     ${OpenCV_INCLUDE_DIRS}
 )
 
+target_include_directories(local_search
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+    ${PCL_INCLUDE_DIRS}
+    ${OpenCV_INCLUDE_DIRS}
+)
+
 target_compile_features(table_person_association PUBLIC cxx_std_17)
+target_compile_features(local_search PUBLIC cxx_std_17)
 
 target_link_libraries(table_person_association
   ${PCL_LIBRARIES}
@@ -42,7 +60,18 @@ target_link_libraries(table_person_association
   ${OpenCV_LIBS}
 )
 
+target_link_libraries(local_search
+  ${PCL_LIBRARIES}
+  ${PCL_IO_LIBRARIES}
+  ${OpenCV_LIBS}
+)
+
 target_compile_definitions(table_person_association
+  PRIVATE
+    ${PCL_DEFINITIONS}
+)
+
+target_compile_definitions(local_search
   PRIVATE
     ${PCL_DEFINITIONS}
 )
@@ -62,18 +91,31 @@ ament_target_dependencies(table_person_association
   inha_interfaces
 )
 
+ament_target_dependencies(local_search
+  cv_bridge
+  geometry_msgs
+  pcl_conversions
+  rclcpp
+  rclcpp_action
+  sensor_msgs
+  std_msgs
+  tf2
+  tf2_ros
+  visualization_msgs
+)
+
 target_link_libraries(table_person_association
   ${cpp_typesupport_target}
 )
 
-install(
-  TARGETS table_person_association
-  DESTINATION lib/${PROJECT_NAME}
+target_link_libraries(local_search
+  ${cpp_typesupport_target}
 )
 
 install(
-  PROGRAMS
-    scripts/local_search_node.py
+  TARGETS
+    table_person_association
+    local_search
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -98,5 +140,7 @@ if(BUILD_TESTING)
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
 endif()
+
+ament_export_dependencies(rosidl_default_runtime)
 
 ament_package()
