@@ -15,18 +15,12 @@ find_package(PCL REQUIRED COMPONENTS common io segmentation search kdtree)
 find_package(pcl_conversions REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_action REQUIRED)
-find_package(rosidl_default_generators REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(visualization_msgs REQUIRED)
-
-rosidl_generate_interfaces(${PROJECT_NAME}
-  "action/AssociateCluster.action"
-  "action/LocalSearch.action"
-  DEPENDENCIES geometry_msgs
-)
+find_package(inha_interfaces REQUIRED)
 
 add_executable(table_person_association
   src/table_person_association.cpp
@@ -65,11 +59,7 @@ ament_target_dependencies(table_person_association
   tf2
   tf2_ros
   visualization_msgs
-)
-
-rosidl_get_typesupport_target(cpp_typesupport_target
-  ${PROJECT_NAME}
-  "rosidl_typesupport_cpp"
+  inha_interfaces
 )
 
 target_link_libraries(table_person_association
@@ -95,11 +85,6 @@ install(
 install(
   DIRECTORY config/
   DESTINATION share/${PROJECT_NAME}/config
-)
-
-install(
-  DIRECTORY action/
-  DESTINATION share/${PROJECT_NAME}/action
 )
 
 if(BUILD_TESTING)

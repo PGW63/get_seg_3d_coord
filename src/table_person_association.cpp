@@ -40,18 +40,18 @@
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 
-#include "get_seg_3d_coord/action/associate_cluster.hpp"
+#include "inha_interfaces/action/associate_cluster.hpp"
 
 class TablePersonAssociation : public rclcpp::Node {
 public:
-  using AssociateCluster = get_seg_3d_coord::action::AssociateCluster;
+  using AssociateCluster = inha_interfaces::action::AssociateCluster;
   using GoalHandle = rclcpp_action::ServerGoalHandle<AssociateCluster>;
 
   TablePersonAssociation()
       : Node("table_person_association"), tf_buffer_(this->get_clock()),
         tf_listener_(tf_buffer_) {
     mask_topic_ = this->declare_parameter<std::string>(
-        "mask_topic", "/binary_mask/compressed");
+        "mask_topic", "/sam2_segmentation_node/binary_mask/compressed");
     pointcloud_topic_ =
         this->declare_parameter<std::string>("pointcloud_topic", "/livox/lidar");
     camera_info_topic_ = this->declare_parameter<std::string>(
