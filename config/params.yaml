@@ -1,17 +1,21 @@
-segmented_lidar_cluster_node:
+table_person_association:
   ros__parameters:
     mask_topic: "/sam2_segmentation_node/binary_mask/compressed"
     pointcloud_topic: "/livox/lidar"
     camera_info_topic: "/camera/camera_head/color/camera_info"
     filtered_cloud_topic: "/segmented_lidar/points"
     centers_topic: "/segmented_lidar/cluster_centers"
+    clustered_cloud_topic: "/segmented_lidar/clustered_points"
     markers_topic: "/segmented_lidar/cluster_markers"
+    action_name: "associate_cluster"
     camera_frame: ""
     mask_threshold: 0
     cluster_tolerance: 0.30
     min_cluster_size: 8
     max_cluster_size: 30000
-    sync_queue_size: 10
-    sync_slop: 0.10
+    input_timeout_sec: 1.0
+    lidar_frame_timeout_sec: 1.0
+    max_decay_frames: 100
+    decay_num: 1
+    max_distance: 0.7
     tf_timeout_sec: 0.05
-    

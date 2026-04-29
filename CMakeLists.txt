@@ -14,17 +14,25 @@ find_package(OpenCV REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common io segmentation search kdtree)
 find_package(pcl_conversions REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_action REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(visualization_msgs REQUIRED)
 
-add_executable(segmented_lidar_cluster_node
-  src/segmented_lidar_cluster_node.cpp
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "action/AssociateCluster.action"
+  "action/LocalSearch.action"
+  DEPENDENCIES geometry_msgs
 )
 
-target_include_directories(segmented_lidar_cluster_node
+add_executable(table_person_association
+  src/table_person_association.cpp
+)
+
+target_include_directories(table_person_association
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
@@ -32,25 +40,26 @@ target_include_directories(segmented_lidar_cluster_node
     ${OpenCV_INCLUDE_DIRS}
 )
 
-target_compile_features(segmented_lidar_cluster_node PUBLIC cxx_std_17)
+target_compile_features(table_person_association PUBLIC cxx_std_17)
 
-target_link_libraries(segmented_lidar_cluster_node
+target_link_libraries(table_person_association
   ${PCL_LIBRARIES}
   ${PCL_IO_LIBRARIES}
   ${OpenCV_LIBS}
 )
 
-target_compile_definitions(segmented_lidar_cluster_node
+target_compile_definitions(table_person_association
   PRIVATE
     ${PCL_DEFINITIONS}
 )
 
-ament_target_dependencies(segmented_lidar_cluster_node
+ament_target_dependencies(table_person_association
   cv_bridge
   geometry_msgs
   message_filters
   pcl_conversions
   rclcpp
+  rclcpp_action
   sensor_msgs
   std_msgs
   tf2
@@ -58,8 +67,23 @@ ament_target_dependencies(segmented_lidar_cluster_node
   visualization_msgs
 )
 
+rosidl_get_typesupport_target(cpp_typesupport_target
+  ${PROJECT_NAME}
+  "rosidl_typesupport_cpp"
+)
+
+target_link_libraries(table_person_association
+  ${cpp_typesupport_target}
+)
+
 install(
-  TARGETS segmented_lidar_cluster_node
+  TARGETS table_person_association
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(
+  PROGRAMS
+    scripts/local_search_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -74,9 +98,8 @@ install(
 )
 
 install(
-  PROGRAMS
-    scripts/segmented_lidar_cluster_node.py
-  DESTINATION lib/${PROJECT_NAME}
+  DIRECTORY action/
+  DESTINATION share/${PROJECT_NAME}/action
 )
 
 if(BUILD_TESTING)

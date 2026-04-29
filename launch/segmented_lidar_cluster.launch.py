@@ -9,14 +9,14 @@ def generate_launch_description():
     package_share = get_package_share_directory("get_seg_3d_coord")
     params_file = os.path.join(package_share, "config", "params.yaml")
 
-    segmented_lidar_cluster_node = Node(
+    table_person_association = Node(
         package="get_seg_3d_coord",
-        executable="segmented_lidar_cluster_node",
-        name="segmented_lidar_cluster_node",
+        executable="table_person_association",
+        name="table_person_association",
         output="screen",
         parameters=[params_file],
     )
 
     return LaunchDescription([
-        segmented_lidar_cluster_node,
+        table_person_association,
     ])
