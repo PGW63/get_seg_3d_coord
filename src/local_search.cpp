@@ -41,7 +41,7 @@
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 
-#include "inha_interfaces/action/LocalSearch.hpp"
+#include "inha_interfaces/action/local_search.hpp"
 
 class LocalSearchActionServer : public rclcpp::Node {
 public:
@@ -762,7 +762,7 @@ private:
   rclcpp::Publisher<PointCloud2Msg>::SharedPtr clustered_cloud_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       markers_pub_;
-  rclcpp_action::Server<GetSegCoord>::SharedPtr action_server_;
+  rclcpp_action::Server<LocalSearch>::SharedPtr action_server_;
 
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
@@ -770,7 +770,7 @@ private:
 
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<GetSegCoordActionServer>());
+  rclcpp::spin(std::make_shared<LocalSearchActionServer>());
   rclcpp::shutdown();
   return 0;
 }
