@@ -508,7 +508,7 @@ private:
       const cv::Mat &mask,
       const std::vector<BBoxCandidate> &candidates,
       pcl::PointCloud<pcl::PointXYZ>::Ptr &accumulated_cloud,
-      std::vector<int> &per_point_bbox) const {
+      std::vector<int> &per_point_bbox) {
     accumulated_cloud->points.clear();
     per_point_bbox.clear();
 
@@ -529,7 +529,7 @@ private:
       const cv::Mat &mask,
       const std::vector<BBoxCandidate> &candidates,
       pcl::PointCloud<pcl::PointXYZ>::Ptr &accumulated_cloud,
-      std::vector<int> &per_point_bbox) const {
+      std::vector<int> &per_point_bbox) {
     auto lidar_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
     pcl::fromROSMsg(*cloud_msg, *lidar_cloud);
     if (lidar_cloud->empty()) {
