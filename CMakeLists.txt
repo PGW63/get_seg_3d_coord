@@ -23,10 +23,6 @@ find_package(vision_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(inha_interfaces REQUIRED)
 
-rosidl_get_typesupport_target(cpp_typesupport_target
-  ${PROJECT_NAME}
-  "rosidl_typesupport_cpp"
-)
 
 add_executable(table_person_association
   src/table_person_association.cpp
@@ -143,7 +139,5 @@ if(BUILD_TESTING)
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
 endif()
-
-ament_export_dependencies(rosidl_default_runtime)
 
 ament_package()
