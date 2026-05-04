@@ -14,6 +14,7 @@
 
 #include <Eigen/Geometry>
 #include <cv_bridge/cv_bridge.h>
+#include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <geometry_msgs/msg/pose.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
@@ -38,10 +39,11 @@
 #include <tf2/exceptions.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
+#include <vision_msgs/msg/detection2_d_array.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 
-#include "inha_interfaces/action/LocalSearch.hpp"
+#include "inha_interfaces/action/local_search.hpp"
 
 class LocalSearchActionServer : public rclcpp::Node {
 public:
@@ -57,6 +59,8 @@ public:
         this->declare_parameter<std::string>("pointcloud_topic", "/livox/lidar");
     camera_info_topic_ = this->declare_parameter<std::string>(
         "camera_info_topic", "/camera/camera_head/color/camera_info");
+    bbox_topic_ = this->declare_parameter<std::string>(
+        "bbox_topic", "/detection/bbox_stream");
     filtered_cloud_topic_ = this->declare_parameter<std::string>(
         "filtered_cloud_topic", "/local_search/points");
     centers_topic_ = this->declare_parameter<std::string>(
@@ -69,6 +73,7 @@ public:
         this->declare_parameter<std::string>("action_name", "local_search");
     camera_frame_param_ =
         this->declare_parameter<std::string>("camera_frame", "");
+    map_frame_ = this->declare_parameter<std::string>("map_frame", "map");
     mask_threshold_ = this->declare_parameter<int>("mask_threshold", 0);
     cluster_tolerance_ =
         this->declare_parameter<double>("cluster_tolerance", 0.30);
@@ -99,6 +104,10 @@ public:
         camera_info_topic_, reliable_qos,
         std::bind(&LocalSearchActionServer::cameraInfoCallback, this,
                   std::placeholders::_1));
+    bbox_sub_ = this->create_subscription<DetectionArrayMsg>(
+        bbox_topic_, best_effort_qos,
+        std::bind(&LocalSearchActionServer::bboxCallback, this,
+                  std::placeholders::_1));
 
     filtered_cloud_pub_ =
         this->create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -122,21 +131,41 @@ public:
 
     RCLCPP_INFO(this->get_logger(),
                 "LocalSearch action node started. action=%s, mask=%s, "
-                "cloud=%s, camera_info=%s",
+                "cloud=%s, camera_info=%s, bbox=%s",
                 action_name_.c_str(), mask_topic_.c_str(),
-                pointcloud_topic_.c_str(), camera_info_topic_.c_str());
+                pointcloud_topic_.c_str(), camera_info_topic_.c_str(),
+                bbox_topic_.c_str());
   }
 
 private:
   using MaskMsg = sensor_msgs::msg::CompressedImage;
   using PointCloud2Msg = sensor_msgs::msg::PointCloud2;
+  using DetectionArrayMsg = vision_msgs::msg::Detection2DArray;
+
+  struct BBoxCandidate {
+    std::string class_id;
+    float score{0.0F};
+    float u_min{0.0F};
+    float u_max{0.0F};
+    float v_min{0.0F};
+    float v_max{0.0F};
+  };
+
+  struct ClusterResult {
+    std::size_t bbox_index{0};
+    std::string class_id;
+    float score{0.0F};
+    Eigen::Vector3f center_lidar{Eigen::Vector3f::Zero()};
+    Eigen::Vector3f center_map{Eigen::Vector3f::Zero()};
+    pcl::PointIndices indices;
+  };
 
   rclcpp_action::GoalResponse
   handleGoal(const rclcpp_action::GoalUUID &,
              std::shared_ptr<const LocalSearch::Goal> goal) {
-    if (goal->num_objects <= 0) {
+    if (goal->class_names.empty()) {
       RCLCPP_WARN(this->get_logger(),
-                  "Rejecting goal: num_objects must be greater than zero.");
+                  "Rejecting goal: class_names is empty.");
       return rclcpp_action::GoalResponse::REJECT;
     }
 
@@ -170,7 +199,6 @@ private:
 
   void executeAction(const std::shared_ptr<GoalHandle> goal_handle) {
     const auto goal = goal_handle->get_goal();
-    const int requested_objects = goal->num_objects;
     auto result = std::make_shared<LocalSearch::Result>();
     auto feedback = std::make_shared<LocalSearch::Feedback>();
 
@@ -180,12 +208,15 @@ private:
 
     cv::Mat mask;
     sensor_msgs::msg::CameraInfo::SharedPtr camera_info;
+    DetectionArrayMsg::ConstSharedPtr bbox_msg;
 
     {
       std::unique_lock<std::mutex> lock(data_mutex_);
       const bool ready = data_cv_.wait_for(
-          lock, std::chrono::duration<double>(input_timeout_sec_),
-          [this]() { return has_mask_ && camera_info_ != nullptr; });
+          lock, std::chrono::duration<double>(input_timeout_sec_), [this]() {
+            return has_mask_ && camera_info_ != nullptr &&
+                   latest_bboxes_ != nullptr;
+          });
 
       if (!ready || !has_mask_) {
         abortGoal(goal_handle, result, "no seg image");
@@ -195,9 +226,14 @@ private:
         abortGoal(goal_handle, result, "no camera info");
         return;
       }
+      if (!latest_bboxes_) {
+        abortGoal(goal_handle, result, "no detections");
+        return;
+      }
 
       mask = latest_mask_.clone();
       camera_info = camera_info_;
+      bbox_msg = latest_bboxes_;
       decay_clouds_.clear();
       target_decay_frames_ = decay_num_;
       collecting_ = true;
@@ -230,53 +266,78 @@ private:
     feedback->state = "CLUSTER";
     goal_handle->publish_feedback(feedback);
 
-    auto accumulated_cloud = accumulateMaskedClouds(clouds, camera_info, mask);
-    const auto cluster_indices = clusterPoints(accumulated_cloud);
-    const auto selected_clusters =
-        selectLargestClusters(cluster_indices, requested_objects);
-    const auto centers = clusterCenters(accumulated_cloud, selected_clusters);
+    const auto requested_classes = std::vector<std::string>(
+        goal->class_names.begin(), goal->class_names.end());
+    const auto candidates =
+        buildBBoxCandidates(*bbox_msg, requested_classes, *camera_info, mask);
+
+    auto accumulated_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+    std::vector<int> per_point_bbox(0);
+    accumulateAndAssign(clouds, camera_info, mask, candidates,
+                        accumulated_cloud, per_point_bbox);
+
+    std::vector<ClusterResult> clusters =
+        clusterPerBBox(accumulated_cloud, per_point_bbox, candidates);
+
     const auto output_header = clouds.back()->header;
+    const std::string lidar_frame = output_header.frame_id;
+
+    if (!transformCentersToMap(clusters, lidar_frame, output_header.stamp)) {
+      abortGoal(goal_handle, result, "tf to map failed");
+      return;
+    }
 
     publishFilteredCloud(output_header, accumulated_cloud);
-    publishCenters(output_header, centers);
-    publishClusteredCloud(output_header, accumulated_cloud, selected_clusters);
-    publishMarkers(output_header, accumulated_cloud, selected_clusters, centers);
+    publishClusteredCloud(output_header, accumulated_cloud, clusters);
+    publishCenters(output_header, clusters);
+    publishMarkers(output_header, accumulated_cloud, clusters);
 
-    feedback->current_num = static_cast<std::int32_t>(centers.size());
+    const Eigen::Vector3f reference(static_cast<float>(goal->reference_position.x),
+                                    static_cast<float>(goal->reference_position.y),
+                                    static_cast<float>(goal->reference_position.z));
+
+    int found_count = 0;
+    result->coords.resize(requested_classes.size());
+    result->found.resize(requested_classes.size());
+    for (std::size_t i = 0; i < requested_classes.size(); ++i) {
+      const auto &name = requested_classes[i];
+      float best_dist_sq = std::numeric_limits<float>::infinity();
+      const ClusterResult *best = nullptr;
+      for (const auto &cluster : clusters) {
+        if (cluster.class_id != name) {
+          continue;
+        }
+        const float d = (cluster.center_map - reference).squaredNorm();
+        if (d < best_dist_sq) {
+          best_dist_sq = d;
+          best = &cluster;
+        }
+      }
+      if (best) {
+        result->coords[i].x = best->center_map.x();
+        result->coords[i].y = best->center_map.y();
+        result->coords[i].z = best->center_map.z();
+        result->found[i] = true;
+        ++found_count;
+      } else {
+        result->coords[i].x = 0.0;
+        result->coords[i].y = 0.0;
+        result->coords[i].z = 0.0;
+        result->found[i] = false;
+      }
+    }
+
+    feedback->current_num = static_cast<std::int32_t>(found_count);
     goal_handle->publish_feedback(feedback);
 
-    for (const auto &center : centers) {
-      geometry_msgs::msg::PointStamped point;
-      point.header = output_header;
-      point.point.x = center.x();
-      point.point.y = center.y();
-      point.point.z = center.z();
-      result->results.push_back(point);
-    }
-
     goal_running_ = false;
-    if (centers.empty()) {
-      result->success = false;
-      result->message = "no points on mask";
-      goal_handle->abort(result);
-      return;
-    }
-
-    if (static_cast<int>(centers.size()) < requested_objects) {
-      result->success = false;
-      char buf[128];
-      std::snprintf(buf, sizeof(buf), "found %zu clusters, need %d",
-                    centers.size(), requested_objects);
-      result->message = buf;
-      goal_handle->abort(result);
-      return;
-    }
-
-    result->success = true;
-    char buf[128];
-    std::snprintf(buf, sizeof(buf), "ok: clusters=%zu frames=%zu",
-                  centers.size(), clouds.size());
+    char buf[160];
+    std::snprintf(buf, sizeof(buf),
+                  "found %d/%zu classes (clusters=%zu, frames=%zu)",
+                  found_count, requested_classes.size(), clusters.size(),
+                  clouds.size());
     result->message = buf;
+    result->success = (found_count == static_cast<int>(requested_classes.size()));
     goal_handle->succeed(result);
   }
 
@@ -287,6 +348,51 @@ private:
     result->success = false;
     result->message = message;
     goal_handle->abort(result);
+  }
+
+  std::vector<BBoxCandidate>
+  buildBBoxCandidates(const DetectionArrayMsg &bbox_msg,
+                      const std::vector<std::string> &requested_classes,
+                      const sensor_msgs::msg::CameraInfo &camera_info,
+                      const cv::Mat &mask) const {
+    std::vector<BBoxCandidate> candidates;
+    candidates.reserve(bbox_msg.detections.size());
+
+    const float img_w = camera_info.width > 0
+                            ? static_cast<float>(camera_info.width)
+                            : static_cast<float>(mask.cols);
+    const float img_h = camera_info.height > 0
+                            ? static_cast<float>(camera_info.height)
+                            : static_cast<float>(mask.rows);
+
+    for (const auto &det : bbox_msg.detections) {
+      if (det.results.empty()) {
+        continue;
+      }
+      const auto &top = det.results.front();
+      const std::string class_id = top.hypothesis.class_id;
+      if (std::find(requested_classes.begin(), requested_classes.end(),
+                    class_id) == requested_classes.end()) {
+        continue;
+      }
+
+      const float cx = static_cast<float>(det.bbox.center.position.x);
+      const float cy = static_cast<float>(det.bbox.center.position.y);
+      const float sx = static_cast<float>(det.bbox.size_x);
+      const float sy = static_cast<float>(det.bbox.size_y);
+      BBoxCandidate cand;
+      cand.class_id = class_id;
+      cand.score = static_cast<float>(top.hypothesis.score);
+      cand.u_min = std::max(0.0F, cx - sx * 0.5F);
+      cand.u_max = std::min(img_w - 1.0F, cx + sx * 0.5F);
+      cand.v_min = std::max(0.0F, cy - sy * 0.5F);
+      cand.v_max = std::min(img_h - 1.0F, cy + sy * 0.5F);
+      if (cand.u_max <= cand.u_min || cand.v_max <= cand.v_min) {
+        continue;
+      }
+      candidates.push_back(cand);
+    }
+    return candidates;
   }
 
   std::vector<PointCloud2Msg::ConstSharedPtr> collectLidarFrames(
@@ -351,6 +457,14 @@ private:
     data_cv_.notify_all();
   }
 
+  void bboxCallback(const DetectionArrayMsg::ConstSharedPtr msg) {
+    {
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      latest_bboxes_ = msg;
+    }
+    data_cv_.notify_all();
+  }
+
   cv::Mat imageToBinaryMask(const MaskMsg::ConstSharedPtr &mask_msg) {
     cv_bridge::CvImagePtr cv_ptr;
     try {
@@ -388,35 +502,38 @@ private:
     return binary;
   }
 
-  pcl::PointCloud<pcl::PointXYZ>::Ptr accumulateMaskedClouds(
+  void accumulateAndAssign(
       const std::vector<PointCloud2Msg::ConstSharedPtr> &clouds,
       const sensor_msgs::msg::CameraInfo::SharedPtr &camera_info,
-      const cv::Mat &mask) {
-    auto accumulated_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+      const cv::Mat &mask,
+      const std::vector<BBoxCandidate> &candidates,
+      pcl::PointCloud<pcl::PointXYZ>::Ptr &accumulated_cloud,
+      std::vector<int> &per_point_bbox) const {
+    accumulated_cloud->points.clear();
+    per_point_bbox.clear();
 
     for (const auto &cloud_msg : clouds) {
-      auto selected_cloud = filterCloudWithMask(cloud_msg, camera_info, mask);
-      accumulated_cloud->points.insert(accumulated_cloud->points.end(),
-                                       selected_cloud->points.begin(),
-                                       selected_cloud->points.end());
+      collectFromOneFrame(cloud_msg, camera_info, mask, candidates,
+                          accumulated_cloud, per_point_bbox);
     }
 
     accumulated_cloud->width =
         static_cast<std::uint32_t>(accumulated_cloud->points.size());
     accumulated_cloud->height = 1;
     accumulated_cloud->is_dense = false;
-    return accumulated_cloud;
   }
 
-  pcl::PointCloud<pcl::PointXYZ>::Ptr filterCloudWithMask(
+  void collectFromOneFrame(
       const PointCloud2Msg::ConstSharedPtr &cloud_msg,
       const sensor_msgs::msg::CameraInfo::SharedPtr &camera_info,
-      const cv::Mat &mask) {
+      const cv::Mat &mask,
+      const std::vector<BBoxCandidate> &candidates,
+      pcl::PointCloud<pcl::PointXYZ>::Ptr &accumulated_cloud,
+      std::vector<int> &per_point_bbox) const {
     auto lidar_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
     pcl::fromROSMsg(*cloud_msg, *lidar_cloud);
-
     if (lidar_cloud->empty()) {
-      return std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+      return;
     }
 
     const std::string camera_frame =
@@ -425,7 +542,7 @@ private:
     if (camera_frame.empty()) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                            "Camera frame is empty.");
-      return std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+      return;
     }
 
     geometry_msgs::msg::TransformStamped transform;
@@ -438,22 +555,11 @@ private:
           this->get_logger(), *this->get_clock(), 2000,
           "Cannot transform cloud frame '%s' to camera frame '%s': %s",
           cloud_msg->header.frame_id.c_str(), camera_frame.c_str(), ex.what());
-      return std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+      return;
     }
 
     const Eigen::Isometry3f lidar_to_camera =
         transformToEigen(transform.transform);
-    return selectPointsOnMask(lidar_cloud, lidar_to_camera, camera_info, mask);
-  }
-
-  pcl::PointCloud<pcl::PointXYZ>::Ptr selectPointsOnMask(
-      const pcl::PointCloud<pcl::PointXYZ>::ConstPtr &lidar_cloud,
-      const Eigen::Isometry3f &lidar_to_camera,
-      const sensor_msgs::msg::CameraInfo::SharedPtr &camera_info,
-      const cv::Mat &mask) const {
-    auto selected = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-    selected->header = lidar_cloud->header;
-    selected->is_dense = false;
 
     const double fx = camera_info->k[0];
     const double fy = camera_info->k[4];
@@ -470,99 +576,146 @@ private:
                   static_cast<double>(camera_info->height)
             : 1.0;
 
-    selected->points.reserve(lidar_cloud->points.size());
     for (const auto &point : lidar_cloud->points) {
       if (!pcl::isFinite(point)) {
         continue;
       }
-
       const Eigen::Vector3f lidar_point(point.x, point.y, point.z);
       const Eigen::Vector3f camera_point = lidar_to_camera * lidar_point;
       if (camera_point.z() <= 0.0F) {
         continue;
       }
 
-      const int u = static_cast<int>(std::lround(
-          (fx * camera_point.x() / camera_point.z() + cx) * x_scale));
-      const int v = static_cast<int>(std::lround(
-          (fy * camera_point.y() / camera_point.z() + cy) * y_scale));
+      const double u_orig = fx * camera_point.x() / camera_point.z() + cx;
+      const double v_orig = fy * camera_point.y() / camera_point.z() + cy;
 
-      if (u < 0 || u >= mask.cols || v < 0 || v >= mask.rows) {
+      int best_bbox = -1;
+      float best_area = std::numeric_limits<float>::infinity();
+      for (std::size_t b = 0; b < candidates.size(); ++b) {
+        const auto &c = candidates[b];
+        if (u_orig < c.u_min || u_orig > c.u_max || v_orig < c.v_min ||
+            v_orig > c.v_max) {
+          continue;
+        }
+        const float area =
+            (c.u_max - c.u_min) * (c.v_max - c.v_min);
+        if (area < best_area) {
+          best_area = area;
+          best_bbox = static_cast<int>(b);
+        }
+      }
+      if (best_bbox < 0) {
         continue;
       }
-      if (mask.at<unsigned char>(v, u) == 0) {
+
+      const int u_mask = static_cast<int>(std::lround(u_orig * x_scale));
+      const int v_mask = static_cast<int>(std::lround(v_orig * y_scale));
+      if (u_mask < 0 || u_mask >= mask.cols || v_mask < 0 ||
+          v_mask >= mask.rows) {
+        continue;
+      }
+      if (mask.at<unsigned char>(v_mask, u_mask) == 0) {
         continue;
       }
 
-      selected->points.push_back(point);
+      accumulated_cloud->points.push_back(point);
+      per_point_bbox.push_back(best_bbox);
     }
-
-    selected->width = static_cast<std::uint32_t>(selected->points.size());
-    selected->height = 1;
-    return selected;
   }
 
-  std::vector<pcl::PointIndices>
-  clusterPoints(const pcl::PointCloud<pcl::PointXYZ>::ConstPtr &cloud) const {
-    std::vector<pcl::PointIndices> cluster_indices;
-    if (static_cast<int>(cloud->points.size()) < min_cluster_size_) {
-      return cluster_indices;
+  std::vector<ClusterResult> clusterPerBBox(
+      const pcl::PointCloud<pcl::PointXYZ>::Ptr &accumulated_cloud,
+      const std::vector<int> &per_point_bbox,
+      const std::vector<BBoxCandidate> &candidates) const {
+    std::vector<ClusterResult> results;
+    if (candidates.empty() || accumulated_cloud->points.empty()) {
+      return results;
     }
 
-    auto tree = std::make_shared<pcl::search::KdTree<pcl::PointXYZ>>();
-    tree->setInputCloud(cloud);
-
-    pcl::EuclideanClusterExtraction<pcl::PointXYZ> extractor;
-    extractor.setClusterTolerance(cluster_tolerance_);
-    extractor.setMinClusterSize(min_cluster_size_);
-    extractor.setMaxClusterSize(max_cluster_size_);
-    extractor.setSearchMethod(tree);
-    extractor.setInputCloud(cloud);
-    extractor.extract(cluster_indices);
-    return cluster_indices;
-  }
-
-  std::vector<pcl::PointIndices> selectLargestClusters(
-      const std::vector<pcl::PointIndices> &cluster_indices,
-      int num_objects) const {
-    std::vector<std::size_t> order(cluster_indices.size());
-    for (std::size_t i = 0; i < order.size(); ++i) {
-      order[i] = i;
+    std::vector<std::vector<int>> bins(candidates.size());
+    for (std::size_t i = 0; i < per_point_bbox.size(); ++i) {
+      bins[per_point_bbox[i]].push_back(static_cast<int>(i));
     }
 
-    std::sort(order.begin(), order.end(),
-              [&cluster_indices](std::size_t lhs, std::size_t rhs) {
-                const auto lhs_size = cluster_indices[lhs].indices.size();
-                const auto rhs_size = cluster_indices[rhs].indices.size();
-                if (lhs_size == rhs_size) {
-                  return lhs < rhs;
-                }
-                return lhs_size > rhs_size;
-              });
+    for (std::size_t b = 0; b < candidates.size(); ++b) {
+      const auto &indices = bins[b];
+      if (static_cast<int>(indices.size()) < min_cluster_size_) {
+        continue;
+      }
 
-    std::vector<pcl::PointIndices> selected;
-    selected.reserve(std::min<std::size_t>(
-        order.size(), static_cast<std::size_t>(num_objects)));
-    for (std::size_t i = 0; i < order.size() &&
-                            static_cast<int>(selected.size()) < num_objects;
-         ++i) {
-      selected.push_back(cluster_indices[order[i]]);
-    }
-    return selected;
-  }
+      auto sub_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+      sub_cloud->points.reserve(indices.size());
+      for (int idx : indices) {
+        sub_cloud->points.push_back(accumulated_cloud->points[idx]);
+      }
+      sub_cloud->width = static_cast<std::uint32_t>(sub_cloud->points.size());
+      sub_cloud->height = 1;
+      sub_cloud->is_dense = false;
 
-  std::vector<Eigen::Vector3f> clusterCenters(
-      const pcl::PointCloud<pcl::PointXYZ>::ConstPtr &cloud,
-      const std::vector<pcl::PointIndices> &cluster_indices) const {
-    std::vector<Eigen::Vector3f> centers;
-    centers.reserve(cluster_indices.size());
+      auto tree = std::make_shared<pcl::search::KdTree<pcl::PointXYZ>>();
+      tree->setInputCloud(sub_cloud);
 
-    for (const auto &cluster : cluster_indices) {
+      std::vector<pcl::PointIndices> cluster_indices;
+      pcl::EuclideanClusterExtraction<pcl::PointXYZ> extractor;
+      extractor.setClusterTolerance(cluster_tolerance_);
+      extractor.setMinClusterSize(min_cluster_size_);
+      extractor.setMaxClusterSize(max_cluster_size_);
+      extractor.setSearchMethod(tree);
+      extractor.setInputCloud(sub_cloud);
+      extractor.extract(cluster_indices);
+
+      if (cluster_indices.empty()) {
+        continue;
+      }
+
+      std::size_t dominant = 0;
+      for (std::size_t k = 1; k < cluster_indices.size(); ++k) {
+        if (cluster_indices[k].indices.size() >
+            cluster_indices[dominant].indices.size()) {
+          dominant = k;
+        }
+      }
+
+      ClusterResult cr;
+      cr.bbox_index = b;
+      cr.class_id = candidates[b].class_id;
+      cr.score = candidates[b].score;
+      cr.indices.indices.reserve(cluster_indices[dominant].indices.size());
+      for (int sub_idx : cluster_indices[dominant].indices) {
+        cr.indices.indices.push_back(indices[sub_idx]);
+      }
+
       Eigen::Vector4f centroid;
-      pcl::compute3DCentroid(*cloud, cluster.indices, centroid);
-      centers.emplace_back(centroid.x(), centroid.y(), centroid.z());
+      pcl::compute3DCentroid(*accumulated_cloud, cr.indices.indices, centroid);
+      cr.center_lidar = Eigen::Vector3f(centroid.x(), centroid.y(), centroid.z());
+      results.push_back(std::move(cr));
     }
-    return centers;
+    return results;
+  }
+
+  bool transformCentersToMap(std::vector<ClusterResult> &clusters,
+                             const std::string &lidar_frame,
+                             const rclcpp::Time &stamp) const {
+    if (clusters.empty()) {
+      return true;
+    }
+    geometry_msgs::msg::TransformStamped tf_msg;
+    try {
+      tf_msg = tf_buffer_.lookupTransform(
+          map_frame_, lidar_frame, stamp,
+          rclcpp::Duration::from_seconds(tf_timeout_sec_));
+    } catch (const tf2::TransformException &ex) {
+      RCLCPP_WARN(this->get_logger(),
+                  "Cannot transform '%s' -> '%s': %s", lidar_frame.c_str(),
+                  map_frame_.c_str(), ex.what());
+      return false;
+    }
+    const Eigen::Isometry3f lidar_to_map =
+        transformToEigen(tf_msg.transform);
+    for (auto &c : clusters) {
+      c.center_map = lidar_to_map * c.center_lidar;
+    }
+    return true;
   }
 
   void publishFilteredCloud(
@@ -575,29 +728,27 @@ private:
   }
 
   void publishCenters(const std_msgs::msg::Header &header,
-                      const std::vector<Eigen::Vector3f> &centers) const {
+                      const std::vector<ClusterResult> &clusters) const {
     geometry_msgs::msg::PoseArray pose_array;
     pose_array.header = header;
-
-    for (const auto &center : centers) {
+    for (const auto &c : clusters) {
       geometry_msgs::msg::Pose pose;
-      pose.position.x = center.x();
-      pose.position.y = center.y();
-      pose.position.z = center.z();
+      pose.position.x = c.center_lidar.x();
+      pose.position.y = c.center_lidar.y();
+      pose.position.z = c.center_lidar.z();
       pose.orientation.w = 1.0;
       pose_array.poses.push_back(pose);
     }
-
     centers_pub_->publish(pose_array);
   }
 
   void publishClusteredCloud(
       const std_msgs::msg::Header &header,
       const pcl::PointCloud<pcl::PointXYZ>::ConstPtr &cloud,
-      const std::vector<pcl::PointIndices> &cluster_indices) const {
+      const std::vector<ClusterResult> &clusters) const {
     std::size_t total_points = 0;
-    for (const auto &cluster : cluster_indices) {
-      total_points += cluster.indices.size();
+    for (const auto &c : clusters) {
+      total_points += c.indices.indices.size();
     }
 
     sensor_msgs::msg::PointCloud2 output;
@@ -616,14 +767,13 @@ private:
     sensor_msgs::PointCloud2Iterator<std::int32_t> iter_cluster_id(
         output, "cluster_id");
 
-    for (std::size_t cluster_id = 0; cluster_id < cluster_indices.size();
-         ++cluster_id) {
-      for (const int point_idx : cluster_indices[cluster_id].indices) {
+    for (std::size_t k = 0; k < clusters.size(); ++k) {
+      for (const int point_idx : clusters[k].indices.indices) {
         const auto &point = cloud->points[point_idx];
         *iter_x = point.x;
         *iter_y = point.y;
         *iter_z = point.z;
-        *iter_cluster_id = static_cast<std::int32_t>(cluster_id);
+        *iter_cluster_id = static_cast<std::int32_t>(k);
         ++iter_x;
         ++iter_y;
         ++iter_z;
@@ -637,8 +787,7 @@ private:
   void publishMarkers(
       const std_msgs::msg::Header &header,
       const pcl::PointCloud<pcl::PointXYZ>::ConstPtr &cloud,
-      const std::vector<pcl::PointIndices> &cluster_indices,
-      const std::vector<Eigen::Vector3f> &centers) const {
+      const std::vector<ClusterResult> &clusters) const {
     visualization_msgs::msg::MarkerArray marker_array;
 
     visualization_msgs::msg::Marker delete_marker;
@@ -646,13 +795,12 @@ private:
     delete_marker.action = visualization_msgs::msg::Marker::DELETEALL;
     marker_array.markers.push_back(delete_marker);
 
-    for (std::size_t i = 0; i < cluster_indices.size(); ++i) {
+    for (std::size_t i = 0; i < clusters.size(); ++i) {
+      const auto &cr = clusters[i];
       Eigen::Vector4f min_point;
       Eigen::Vector4f max_point;
-      pcl::getMinMax3D(*cloud, cluster_indices[i].indices, min_point,
-                       max_point);
+      pcl::getMinMax3D(*cloud, cr.indices.indices, min_point, max_point);
 
-      const auto &center = centers[i];
       const double scale_x =
           std::max(static_cast<double>(max_point.x() - min_point.x()), 0.05);
       const double scale_y =
@@ -662,13 +810,13 @@ private:
 
       visualization_msgs::msg::Marker marker;
       marker.header = header;
-      marker.ns = "segmented_lidar_clusters";
+      marker.ns = "local_search_clusters";
       marker.id = static_cast<int>(i);
       marker.type = visualization_msgs::msg::Marker::CUBE;
       marker.action = visualization_msgs::msg::Marker::ADD;
-      marker.pose.position.x = center.x();
-      marker.pose.position.y = center.y();
-      marker.pose.position.z = center.z();
+      marker.pose.position.x = cr.center_lidar.x();
+      marker.pose.position.y = cr.center_lidar.y();
+      marker.pose.position.z = cr.center_lidar.z();
       marker.pose.orientation.w = 1.0;
       marker.scale.x = scale_x;
       marker.scale.y = scale_y;
@@ -681,23 +829,23 @@ private:
 
       visualization_msgs::msg::Marker text_marker;
       text_marker.header = header;
-      text_marker.ns = "segmented_lidar_cluster_labels";
+      text_marker.ns = "local_search_cluster_labels";
       text_marker.id = static_cast<int>(i);
       text_marker.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
       text_marker.action = visualization_msgs::msg::Marker::ADD;
-      text_marker.pose.position.x = center.x();
-      text_marker.pose.position.y = center.y();
-      text_marker.pose.position.z = center.z() + scale_z * 0.5 + 0.15;
+      text_marker.pose.position.x = cr.center_lidar.x();
+      text_marker.pose.position.y = cr.center_lidar.y();
+      text_marker.pose.position.z = cr.center_lidar.z() + scale_z * 0.5 + 0.15;
       text_marker.pose.orientation.w = 1.0;
       text_marker.scale.z = 0.18;
       text_marker.color.r = 1.0F;
       text_marker.color.g = 1.0F;
       text_marker.color.b = 1.0F;
       text_marker.color.a = 1.0F;
-      text_marker.text =
-          std::to_string(i) + ": (" + formatFloat(center.x()) + ", " +
-          formatFloat(center.y()) + ", " + formatFloat(center.z()) +
-          ") n=" + std::to_string(cluster_indices[i].indices.size());
+      char score_buf[16];
+      std::snprintf(score_buf, sizeof(score_buf), "%.2f", cr.score);
+      text_marker.text = cr.class_id + " (" + score_buf + ") n=" +
+                         std::to_string(cr.indices.indices.size());
       marker_array.markers.push_back(text_marker);
     }
 
@@ -718,21 +866,17 @@ private:
     return eigen_transform;
   }
 
-  std::string formatFloat(float value) const {
-    char buffer[32];
-    std::snprintf(buffer, sizeof(buffer), "%.2f", value);
-    return std::string(buffer);
-  }
-
   std::string mask_topic_;
   std::string pointcloud_topic_;
   std::string camera_info_topic_;
+  std::string bbox_topic_;
   std::string filtered_cloud_topic_;
   std::string centers_topic_;
   std::string clustered_cloud_topic_;
   std::string markers_topic_;
   std::string action_name_;
   std::string camera_frame_param_;
+  std::string map_frame_;
   int mask_threshold_{0};
   double cluster_tolerance_{0.30};
   int min_cluster_size_{8};
@@ -751,18 +895,20 @@ private:
   int target_decay_frames_{0};
   cv::Mat latest_mask_;
   sensor_msgs::msg::CameraInfo::SharedPtr camera_info_;
+  DetectionArrayMsg::ConstSharedPtr latest_bboxes_;
   std::vector<PointCloud2Msg::ConstSharedPtr> decay_clouds_;
 
   rclcpp::Subscription<MaskMsg>::SharedPtr mask_sub_;
   rclcpp::Subscription<PointCloud2Msg>::SharedPtr cloud_sub_;
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr
       camera_info_sub_;
+  rclcpp::Subscription<DetectionArrayMsg>::SharedPtr bbox_sub_;
   rclcpp::Publisher<PointCloud2Msg>::SharedPtr filtered_cloud_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr centers_pub_;
   rclcpp::Publisher<PointCloud2Msg>::SharedPtr clustered_cloud_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       markers_pub_;
-  rclcpp_action::Server<GetSegCoord>::SharedPtr action_server_;
+  rclcpp_action::Server<LocalSearch>::SharedPtr action_server_;
 
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
@@ -770,7 +916,7 @@ private:
 
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<GetSegCoordActionServer>());
+  rclcpp::spin(std::make_shared<LocalSearchActionServer>());
   rclcpp::shutdown();
   return 0;
 }

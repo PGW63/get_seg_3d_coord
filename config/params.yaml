@@ -25,12 +25,14 @@ local_search:
     mask_topic: "/sam2_segmentation_node/binary_mask/compressed"
     pointcloud_topic: "/livox/lidar"
     camera_info_topic: "/camera/camera_head/color/camera_info"
+    bbox_topic: "/detection/bbox_stream"
     filtered_cloud_topic: "/local_search/points"
     centers_topic: "/local_search/cluster_centers"
     clustered_cloud_topic: "/local_search/clustered_points"
     markers_topic: "/local_search/cluster_markers"
     action_name: "local_search"
-    camera_frame: ""
+    camera_frame: "camera_head_color_optical_frame"
+    map_frame: "map"
     mask_threshold: 0
     cluster_tolerance: 0.30
     min_cluster_size: 8
