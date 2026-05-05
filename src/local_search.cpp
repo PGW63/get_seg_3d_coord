@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -13,6 +14,7 @@
 #include <vector>
 
 #include <Eigen/Geometry>
+#include <builtin_interfaces/msg/time.hpp>
 #include <cv_bridge/cv_bridge.h>
 #include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
@@ -20,6 +22,9 @@
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <geometry_msgs/msg/transform.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <message_filters/subscriber.h>
+#include <message_filters/sync_policies/approximate_time.h>
+#include <message_filters/synchronizer.h>
 #include <opencv2/imgproc.hpp>
 #include <pcl/common/centroid.h>
 #include <pcl/common/common.h>
@@ -55,58 +60,101 @@ public:
         tf_listener_(tf_buffer_) {
     mask_topic_ = this->declare_parameter<std::string>(
         "mask_topic", "/sam2_segmentation_node/binary_mask/compressed");
-    pointcloud_topic_ =
-        this->declare_parameter<std::string>("pointcloud_topic", "/livox/lidar");
+    pointcloud_topic_ = this->declare_parameter<std::string>(
+        "pointcloud_topic", "/approach/accumulated_cloud");
     camera_info_topic_ = this->declare_parameter<std::string>(
         "camera_info_topic", "/camera/camera_head/color/camera_info");
     bbox_topic_ = this->declare_parameter<std::string>(
         "bbox_topic", "/detection/bbox_stream");
     filtered_cloud_topic_ = this->declare_parameter<std::string>(
-        "filtered_cloud_topic", "/local_search/points");
+        "filtered_cloud_topic", "~/points");
     centers_topic_ = this->declare_parameter<std::string>(
-        "centers_topic", "/local_search/cluster_centers");
+        "centers_topic", "~/cluster_centers");
     clustered_cloud_topic_ = this->declare_parameter<std::string>(
-        "clustered_cloud_topic", "/local_search/clustered_points");
+        "clustered_cloud_topic", "~/clustered_points");
     markers_topic_ = this->declare_parameter<std::string>(
-        "markers_topic", "/local_search/cluster_markers");
+        "markers_topic", "~/cluster_markers");
     action_name_ =
         this->declare_parameter<std::string>("action_name", "local_search");
     camera_frame_param_ =
-        this->declare_parameter<std::string>("camera_frame", "");
+        this->declare_parameter<std::string>("camera_frame", "camera_head_color_optical_frame");
     map_frame_ = this->declare_parameter<std::string>("map_frame", "map");
     mask_threshold_ = this->declare_parameter<int>("mask_threshold", 0);
     cluster_tolerance_ =
-        this->declare_parameter<double>("cluster_tolerance", 0.30);
+        this->declare_parameter<double>("cluster_tolerance", 0.05);
     min_cluster_size_ = this->declare_parameter<int>("min_cluster_size", 8);
     max_cluster_size_ =
         this->declare_parameter<int>("max_cluster_size", 30000);
     input_timeout_sec_ =
         this->declare_parameter<double>("input_timeout_sec", 1.0);
-    lidar_frame_timeout_sec_ =
-        this->declare_parameter<double>("lidar_frame_timeout_sec", 1.0);
-    max_decay_frames_ = this->declare_parameter<int>("max_decay_frames", 100);
-    decay_num_ = this->declare_parameter<int>("decay_num", 1);
-    tf_timeout_sec_ = this->declare_parameter<double>("tf_timeout_sec", 0.1);
-    decay_num_ = std::clamp(decay_num_, 1, max_decay_frames_);
+    input_sync_queue_size_ =
+        this->declare_parameter<int>("input_sync_queue_size", 10);
+    input_sync_slop_sec_ =
+        this->declare_parameter<double>("input_sync_slop_sec", 0.2);
+    tf_timeout_sec_ = this->declare_parameter<double>("tf_timeout_sec", 0.5);
+    prefilter_cloud_ =
+        this->declare_parameter<bool>("prefilter_cloud", false);
+    prefilter_frame_ =
+        this->declare_parameter<std::string>("prefilter_frame", "base_link");
+    prefilter_x_min_ =
+        this->declare_parameter<double>("prefilter_x_min", 0.0);
+    prefilter_x_max_ =
+        this->declare_parameter<double>("prefilter_x_max", 5.0);
+    prefilter_y_min_ =
+        this->declare_parameter<double>("prefilter_y_min", -2.0);
+    prefilter_y_max_ =
+        this->declare_parameter<double>("prefilter_y_max", 2.0);
+    prefilter_z_min_ =
+        this->declare_parameter<double>("prefilter_z_min", -0.05);
+    prefilter_z_max_ =
+        this->declare_parameter<double>("prefilter_z_max", 2.0);
+    foreground_cell_size_px_ =
+        this->declare_parameter<int>("foreground_cell_size_px", 4);
+    foreground_depth_margin_m_ =
+        this->declare_parameter<double>("foreground_depth_margin_m", 0.15);
+    depth_histogram_bin_size_m_ =
+        this->declare_parameter<double>("depth_histogram_bin_size_m", 0.10);
+    min_depth_bin_points_ =
+        this->declare_parameter<int>("min_depth_bin_points", 8);
+    depth_bin_neighbor_count_ =
+        this->declare_parameter<int>("depth_bin_neighbor_count", 1);
+    foreground_cell_size_px_ = std::max(1, foreground_cell_size_px_);
+    foreground_depth_margin_m_ = std::max(0.0, foreground_depth_margin_m_);
+    depth_histogram_bin_size_m_ =
+        std::max(0.01, depth_histogram_bin_size_m_);
+    min_depth_bin_points_ = std::max(1, min_depth_bin_points_);
+    depth_bin_neighbor_count_ = std::max(0, depth_bin_neighbor_count_);
+    input_sync_queue_size_ = std::max(1, input_sync_queue_size_);
+    input_sync_slop_sec_ = std::max(0.0, input_sync_slop_sec_);
+    if (prefilter_x_min_ > prefilter_x_max_) {
+      std::swap(prefilter_x_min_, prefilter_x_max_);
+    }
+    if (prefilter_y_min_ > prefilter_y_max_) {
+      std::swap(prefilter_y_min_, prefilter_y_max_);
+    }
+    if (prefilter_z_min_ > prefilter_z_max_) {
+      std::swap(prefilter_z_min_, prefilter_z_max_);
+    }
 
     auto best_effort_qos = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort();
     auto reliable_qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
 
-    mask_sub_ = this->create_subscription<MaskMsg>(
-        mask_topic_, best_effort_qos,
-        std::bind(&LocalSearchActionServer::maskCallback, this,
-                  std::placeholders::_1));
-    cloud_sub_ = this->create_subscription<PointCloud2Msg>(
-        pointcloud_topic_, best_effort_qos,
-        std::bind(&LocalSearchActionServer::cloudCallback, this,
-                  std::placeholders::_1));
+    mask_sub_.subscribe(this, mask_topic_, best_effort_qos.get_rmw_qos_profile());
+    cloud_sub_.subscribe(this, pointcloud_topic_,
+                         best_effort_qos.get_rmw_qos_profile());
+    bbox_sub_.subscribe(this, bbox_topic_, reliable_qos.get_rmw_qos_profile());
+    input_sync_ =
+        std::make_shared<InputSynchronizer>(InputSyncPolicy(input_sync_queue_size_),
+                                            mask_sub_, cloud_sub_, bbox_sub_);
+    input_sync_->setMaxIntervalDuration(
+        rclcpp::Duration::from_seconds(input_sync_slop_sec_));
+    input_sync_->registerCallback(
+        std::bind(&LocalSearchActionServer::syncedInputCallback, this,
+                  std::placeholders::_1, std::placeholders::_2,
+                  std::placeholders::_3));
     camera_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
         camera_info_topic_, reliable_qos,
         std::bind(&LocalSearchActionServer::cameraInfoCallback, this,
-                  std::placeholders::_1));
-    bbox_sub_ = this->create_subscription<DetectionArrayMsg>(
-        bbox_topic_, best_effort_qos,
-        std::bind(&LocalSearchActionServer::bboxCallback, this,
                   std::placeholders::_1));
 
     filtered_cloud_pub_ =
@@ -141,6 +189,10 @@ private:
   using MaskMsg = sensor_msgs::msg::CompressedImage;
   using PointCloud2Msg = sensor_msgs::msg::PointCloud2;
   using DetectionArrayMsg = vision_msgs::msg::Detection2DArray;
+  using InputSyncPolicy =
+      message_filters::sync_policies::ApproximateTime<MaskMsg, PointCloud2Msg,
+                                                       DetectionArrayMsg>;
+  using InputSynchronizer = message_filters::Synchronizer<InputSyncPolicy>;
 
   struct BBoxCandidate {
     std::string class_id;
@@ -160,6 +212,20 @@ private:
     pcl::PointIndices indices;
   };
 
+  struct ProjectedPointCandidate {
+    pcl::PointXYZ point;
+    int bbox_index{-1};
+    int cell_index{-1};
+    float depth{0.0F};
+  };
+
+  struct SyncedInput {
+    cv::Mat mask;
+    std_msgs::msg::Header mask_header;
+    PointCloud2Msg::ConstSharedPtr cloud_msg;
+    DetectionArrayMsg::ConstSharedPtr bbox_msg;
+  };
+
   rclcpp_action::GoalResponse
   handleGoal(const rclcpp_action::GoalUUID &,
              std::shared_ptr<const LocalSearch::Goal> goal) {
@@ -170,7 +236,7 @@ private:
     }
 
     std::lock_guard<std::mutex> lock(data_mutex_);
-    if (goal_running_ || collecting_) {
+    if (goal_running_) {
       RCLCPP_WARN(this->get_logger(),
                   "Rejecting goal because another goal is already running.");
       return rclcpp_action::GoalResponse::REJECT;
@@ -183,7 +249,6 @@ private:
   handleCancel(const std::shared_ptr<GoalHandle>) {
     {
       std::lock_guard<std::mutex> lock(data_mutex_);
-      collecting_ = false;
       goal_running_ = false;
     }
     data_cv_.notify_all();
@@ -207,59 +272,63 @@ private:
     goal_handle->publish_feedback(feedback);
 
     cv::Mat mask;
+    std_msgs::msg::Header mask_header;
     sensor_msgs::msg::CameraInfo::SharedPtr camera_info;
     DetectionArrayMsg::ConstSharedPtr bbox_msg;
+    PointCloud2Msg::ConstSharedPtr cloud_msg;
 
     {
       std::unique_lock<std::mutex> lock(data_mutex_);
       const bool ready = data_cv_.wait_for(
-          lock, std::chrono::duration<double>(input_timeout_sec_), [this]() {
-            return has_mask_ && camera_info_ != nullptr &&
-                   latest_bboxes_ != nullptr;
+          lock, std::chrono::duration<double>(input_timeout_sec_),
+          [this, &goal_handle]() {
+            return goal_handle->is_canceling() ||
+                   (has_synced_input_ && camera_info_ != nullptr);
           });
 
-      if (!ready || !has_mask_) {
-        abortGoal(goal_handle, result, "no seg image");
+      if (goal_handle->is_canceling()) {
+        goal_running_ = false;
+        result->success = false;
+        result->message = "canceled";
+        goal_handle->canceled(result);
+        return;
+      }
+      if (!ready) {
+        abortGoal(goal_handle, result, "input timeout");
         return;
       }
       if (!camera_info_) {
         abortGoal(goal_handle, result, "no camera info");
         return;
       }
-      if (!latest_bboxes_) {
+      if (!has_synced_input_) {
+        abortGoal(goal_handle, result, "no synced inputs");
+        return;
+      }
+      if (!latest_synced_input_.bbox_msg) {
         abortGoal(goal_handle, result, "no detections");
         return;
       }
+      if (!latest_synced_input_.cloud_msg) {
+        abortGoal(goal_handle, result, "no accumulated cloud");
+        return;
+      }
 
-      mask = latest_mask_.clone();
+      mask = latest_synced_input_.mask.clone();
+      mask_header = latest_synced_input_.mask_header;
       camera_info = camera_info_;
-      bbox_msg = latest_bboxes_;
-      decay_clouds_.clear();
-      target_decay_frames_ = decay_num_;
-      collecting_ = true;
+      bbox_msg = latest_synced_input_.bbox_msg;
+      cloud_msg = latest_synced_input_.cloud_msg;
     }
 
-    feedback->state = "COLLECT_LIDAR";
+    feedback->state = "PROJECT_ACCUMULATED_CLOUD";
     goal_handle->publish_feedback(feedback);
-
-    auto clouds = collectLidarFrames(goal_handle, decay_num_);
-    {
-      std::lock_guard<std::mutex> lock(data_mutex_);
-      collecting_ = false;
-      target_decay_frames_ = 0;
-    }
-    data_cv_.notify_all();
 
     if (goal_handle->is_canceling()) {
       goal_running_ = false;
       result->success = false;
       result->message = "canceled";
       goal_handle->canceled(result);
-      return;
-    }
-
-    if (clouds.empty()) {
-      abortGoal(goal_handle, result, "no lidar");
       return;
     }
 
@@ -273,13 +342,16 @@ private:
 
     auto accumulated_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
     std::vector<int> per_point_bbox(0);
-    accumulateAndAssign(clouds, camera_info, mask, candidates,
+    const rclcpp::Time projection_stamp =
+        selectProjectionStamp(mask_header, *bbox_msg, *camera_info, *cloud_msg);
+    accumulateAndAssign(cloud_msg, camera_info, mask, candidates,
+                        projection_stamp,
                         accumulated_cloud, per_point_bbox);
 
     std::vector<ClusterResult> clusters =
         clusterPerBBox(accumulated_cloud, per_point_bbox, candidates);
 
-    const auto output_header = clouds.back()->header;
+    const auto output_header = cloud_msg->header;
     const std::string lidar_frame = output_header.frame_id;
 
     if (!transformCentersToMap(clusters, lidar_frame, output_header.stamp)) {
@@ -333,9 +405,9 @@ private:
     goal_running_ = false;
     char buf[160];
     std::snprintf(buf, sizeof(buf),
-                  "found %d/%zu classes (clusters=%zu, frames=%zu)",
+                  "found %d/%zu classes (clusters=%zu, points=%zu)",
                   found_count, requested_classes.size(), clusters.size(),
-                  clouds.size());
+                  accumulated_cloud->points.size());
     result->message = buf;
     result->success = (found_count == static_cast<int>(requested_classes.size()));
     goal_handle->succeed(result);
@@ -395,56 +467,21 @@ private:
     return candidates;
   }
 
-  std::vector<PointCloud2Msg::ConstSharedPtr> collectLidarFrames(
-      const std::shared_ptr<GoalHandle> &goal_handle, int target_frames) {
-    std::vector<PointCloud2Msg::ConstSharedPtr> clouds;
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::duration<double>(
-                              lidar_frame_timeout_sec_ * target_frames);
-
-    std::unique_lock<std::mutex> lock(data_mutex_);
-    while (rclcpp::ok() && !goal_handle->is_canceling() &&
-           static_cast<int>(clouds.size()) < target_frames) {
-      data_cv_.wait_until(lock, deadline, [this, &clouds, target_frames]() {
-        return decay_clouds_.size() > clouds.size() ||
-               static_cast<int>(decay_clouds_.size()) >= target_frames ||
-               !collecting_;
-      });
-
-      while (clouds.size() < decay_clouds_.size() &&
-             static_cast<int>(clouds.size()) < target_frames) {
-        clouds.push_back(decay_clouds_[clouds.size()]);
-      }
-
-      if (std::chrono::steady_clock::now() >= deadline || !collecting_) {
-        break;
-      }
-    }
-
-    return clouds;
-  }
-
-  void maskCallback(const MaskMsg::ConstSharedPtr msg) {
-    cv::Mat mask = imageToBinaryMask(msg);
+  void syncedInputCallback(const MaskMsg::ConstSharedPtr mask_msg,
+                           const PointCloud2Msg::ConstSharedPtr cloud_msg,
+                           const DetectionArrayMsg::ConstSharedPtr bbox_msg) {
+    cv::Mat mask = imageToBinaryMask(mask_msg);
     if (mask.empty()) {
       return;
     }
 
     {
       std::lock_guard<std::mutex> lock(data_mutex_);
-      latest_mask_ = mask;
-      has_mask_ = true;
-    }
-    data_cv_.notify_all();
-  }
-
-  void cloudCallback(const PointCloud2Msg::ConstSharedPtr msg) {
-    {
-      std::lock_guard<std::mutex> lock(data_mutex_);
-      if (collecting_ &&
-          static_cast<int>(decay_clouds_.size()) < target_decay_frames_) {
-        decay_clouds_.push_back(msg);
-      }
+      latest_synced_input_.mask = mask;
+      latest_synced_input_.mask_header = mask_msg->header;
+      latest_synced_input_.cloud_msg = cloud_msg;
+      latest_synced_input_.bbox_msg = bbox_msg;
+      has_synced_input_ = true;
     }
     data_cv_.notify_all();
   }
@@ -457,12 +494,25 @@ private:
     data_cv_.notify_all();
   }
 
-  void bboxCallback(const DetectionArrayMsg::ConstSharedPtr msg) {
-    {
-      std::lock_guard<std::mutex> lock(data_mutex_);
-      latest_bboxes_ = msg;
+  bool hasValidStamp(const builtin_interfaces::msg::Time &stamp) const {
+    return stamp.sec != 0 || stamp.nanosec != 0U;
+  }
+
+  rclcpp::Time selectProjectionStamp(
+      const std_msgs::msg::Header &mask_header,
+      const DetectionArrayMsg &bbox_msg,
+      const sensor_msgs::msg::CameraInfo &camera_info,
+      const PointCloud2Msg &cloud_msg) const {
+    if (hasValidStamp(mask_header.stamp)) {
+      return rclcpp::Time(mask_header.stamp);
     }
-    data_cv_.notify_all();
+    if (hasValidStamp(bbox_msg.header.stamp)) {
+      return rclcpp::Time(bbox_msg.header.stamp);
+    }
+    if (hasValidStamp(camera_info.header.stamp)) {
+      return rclcpp::Time(camera_info.header.stamp);
+    }
+    return rclcpp::Time(cloud_msg.header.stamp);
   }
 
   cv::Mat imageToBinaryMask(const MaskMsg::ConstSharedPtr &mask_msg) {
@@ -503,19 +553,19 @@ private:
   }
 
   void accumulateAndAssign(
-      const std::vector<PointCloud2Msg::ConstSharedPtr> &clouds,
+      const PointCloud2Msg::ConstSharedPtr &cloud_msg,
       const sensor_msgs::msg::CameraInfo::SharedPtr &camera_info,
       const cv::Mat &mask,
       const std::vector<BBoxCandidate> &candidates,
+      const rclcpp::Time &projection_stamp,
       pcl::PointCloud<pcl::PointXYZ>::Ptr &accumulated_cloud,
       std::vector<int> &per_point_bbox) {
     accumulated_cloud->points.clear();
     per_point_bbox.clear();
 
-    for (const auto &cloud_msg : clouds) {
-      collectFromOneFrame(cloud_msg, camera_info, mask, candidates,
-                          accumulated_cloud, per_point_bbox);
-    }
+    collectFromOneFrame(cloud_msg, camera_info, mask, candidates,
+                        projection_stamp,
+                        accumulated_cloud, per_point_bbox);
 
     accumulated_cloud->width =
         static_cast<std::uint32_t>(accumulated_cloud->points.size());
@@ -528,6 +578,7 @@ private:
       const sensor_msgs::msg::CameraInfo::SharedPtr &camera_info,
       const cv::Mat &mask,
       const std::vector<BBoxCandidate> &candidates,
+      const rclcpp::Time &projection_stamp,
       pcl::PointCloud<pcl::PointXYZ>::Ptr &accumulated_cloud,
       std::vector<int> &per_point_bbox) {
     auto lidar_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
@@ -548,7 +599,7 @@ private:
     geometry_msgs::msg::TransformStamped transform;
     try {
       transform = tf_buffer_.lookupTransform(
-          camera_frame, cloud_msg->header.frame_id, cloud_msg->header.stamp,
+          camera_frame, cloud_msg->header.frame_id, projection_stamp,
           rclcpp::Duration::from_seconds(tf_timeout_sec_));
     } catch (const tf2::TransformException &ex) {
       RCLCPP_WARN_THROTTLE(
@@ -560,6 +611,24 @@ private:
 
     const Eigen::Isometry3f lidar_to_camera =
         transformToEigen(transform.transform);
+    Eigen::Isometry3f lidar_to_prefilter = Eigen::Isometry3f::Identity();
+    bool use_prefilter = false;
+    if (prefilter_cloud_ && !prefilter_frame_.empty()) {
+      try {
+        const auto prefilter_tf = tf_buffer_.lookupTransform(
+            prefilter_frame_, cloud_msg->header.frame_id, projection_stamp,
+            rclcpp::Duration::from_seconds(tf_timeout_sec_));
+        lidar_to_prefilter = transformToEigen(prefilter_tf.transform);
+        use_prefilter = true;
+      } catch (const tf2::TransformException &ex) {
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 2000,
+            "Cannot transform cloud frame '%s' to prefilter frame '%s'; "
+            "continuing without cloud prefilter: %s",
+            cloud_msg->header.frame_id.c_str(), prefilter_frame_.c_str(),
+            ex.what());
+      }
+    }
 
     const double fx = camera_info->k[0];
     const double fy = camera_info->k[4];
@@ -576,11 +645,38 @@ private:
                   static_cast<double>(camera_info->height)
             : 1.0;
 
+    const int cell_size = std::max(1, foreground_cell_size_px_);
+    const int cell_cols = std::max(1, (mask.cols + cell_size - 1) / cell_size);
+    const int cell_rows = std::max(1, (mask.rows + cell_size - 1) / cell_size);
+    const int cell_count = cell_cols * cell_rows;
+    const float inf = std::numeric_limits<float>::infinity();
+    std::vector<std::vector<float>> min_depths(
+        candidates.size(), std::vector<float>(cell_count, inf));
+    std::vector<ProjectedPointCandidate> projected_points;
+    projected_points.reserve(lidar_cloud->points.size());
+
+    std::size_t finite_points = 0;
+    std::size_t prefiltered_points = 0;
+    std::size_t projected_mask_points = 0;
     for (const auto &point : lidar_cloud->points) {
       if (!pcl::isFinite(point)) {
         continue;
       }
+      ++finite_points;
       const Eigen::Vector3f lidar_point(point.x, point.y, point.z);
+      if (use_prefilter) {
+        const Eigen::Vector3f prefilter_point =
+            lidar_to_prefilter * lidar_point;
+        if (prefilter_point.x() < prefilter_x_min_ ||
+            prefilter_point.x() > prefilter_x_max_ ||
+            prefilter_point.y() < prefilter_y_min_ ||
+            prefilter_point.y() > prefilter_y_max_ ||
+            prefilter_point.z() < prefilter_z_min_ ||
+            prefilter_point.z() > prefilter_z_max_) {
+          continue;
+        }
+      }
+      ++prefiltered_points;
       const Eigen::Vector3f camera_point = lidar_to_camera * lidar_point;
       if (camera_point.z() <= 0.0F) {
         continue;
@@ -617,10 +713,112 @@ private:
       if (mask.at<unsigned char>(v_mask, u_mask) == 0) {
         continue;
       }
+      ++projected_mask_points;
 
-      accumulated_cloud->points.push_back(point);
-      per_point_bbox.push_back(best_bbox);
+      const int cell_x =
+          std::clamp(u_mask / cell_size, 0, cell_cols - 1);
+      const int cell_y =
+          std::clamp(v_mask / cell_size, 0, cell_rows - 1);
+      const int cell_index = cell_y * cell_cols + cell_x;
+      const float depth = camera_point.z();
+
+      projected_points.push_back(
+          ProjectedPointCandidate{point, best_bbox, cell_index, depth});
+      float &min_depth = min_depths[best_bbox][cell_index];
+      if (depth < min_depth) {
+        min_depth = depth;
+      }
     }
+
+    if (projected_points.empty()) {
+      return;
+    }
+
+    std::vector<std::vector<float>> foreground_depths(candidates.size());
+    foreground_depths.reserve(candidates.size());
+    for (const auto &candidate : projected_points) {
+      const float local_min =
+          min_depths[candidate.bbox_index][candidate.cell_index];
+      if (candidate.depth <=
+          local_min + static_cast<float>(foreground_depth_margin_m_)) {
+        foreground_depths[candidate.bbox_index].push_back(candidate.depth);
+      }
+    }
+
+    std::vector<int> selected_bins(candidates.size(), -1);
+    std::vector<float> min_depth_by_bbox(candidates.size(), inf);
+    for (std::size_t b = 0; b < foreground_depths.size(); ++b) {
+      const auto &depths = foreground_depths[b];
+      if (depths.empty()) {
+        continue;
+      }
+
+      const auto minmax = std::minmax_element(depths.begin(), depths.end());
+      const float min_depth = *minmax.first;
+      const float max_depth = *minmax.second;
+      min_depth_by_bbox[b] = min_depth;
+      const int bin_count = std::max(
+          1, static_cast<int>(
+                 std::floor((max_depth - min_depth) /
+                            static_cast<float>(depth_histogram_bin_size_m_))) +
+                 1);
+      std::vector<int> counts(bin_count, 0);
+      for (const float depth : depths) {
+        const int bin = std::clamp(
+            static_cast<int>(
+                std::floor((depth - min_depth) /
+                           static_cast<float>(depth_histogram_bin_size_m_))),
+            0, bin_count - 1);
+        ++counts[bin];
+      }
+
+      int selected_bin = -1;
+      for (int bin = 0; bin < bin_count; ++bin) {
+        if (counts[bin] >= min_depth_bin_points_) {
+          selected_bin = bin;
+          break;
+        }
+      }
+      if (selected_bin < 0) {
+        selected_bin = static_cast<int>(
+            std::distance(counts.begin(),
+                          std::max_element(counts.begin(), counts.end())));
+      }
+      selected_bins[b] = selected_bin;
+    }
+
+    for (const auto &candidate : projected_points) {
+      const int bbox_index = candidate.bbox_index;
+      const float local_min =
+          min_depths[bbox_index][candidate.cell_index];
+      if (candidate.depth >
+          local_min + static_cast<float>(foreground_depth_margin_m_)) {
+        continue;
+      }
+      if (selected_bins[bbox_index] < 0 ||
+          !std::isfinite(min_depth_by_bbox[bbox_index])) {
+        continue;
+      }
+
+      const int bin = std::max(
+          0,
+          static_cast<int>(
+              std::floor((candidate.depth - min_depth_by_bbox[bbox_index]) /
+                         static_cast<float>(depth_histogram_bin_size_m_))));
+      if (std::abs(bin - selected_bins[bbox_index]) >
+          depth_bin_neighbor_count_) {
+        continue;
+      }
+
+      accumulated_cloud->points.push_back(candidate.point);
+      per_point_bbox.push_back(bbox_index);
+    }
+
+    RCLCPP_DEBUG(this->get_logger(),
+                 "local_search cloud filter: raw=%zu finite=%zu prefiltered=%zu "
+                 "bbox_mask=%zu final=%zu",
+                 lidar_cloud->points.size(), finite_points, prefiltered_points,
+                 projected_mask_points, accumulated_cloud->points.size());
   }
 
   std::vector<ClusterResult> clusterPerBBox(
@@ -697,6 +895,12 @@ private:
                              const std::string &lidar_frame,
                              const rclcpp::Time &stamp) const {
     if (clusters.empty()) {
+      return true;
+    }
+    if (lidar_frame == map_frame_) {
+      for (auto &c : clusters) {
+        c.center_map = c.center_lidar;
+      }
       return true;
     }
     geometry_msgs::msg::TransformStamped tf_msg;
@@ -882,27 +1086,36 @@ private:
   int min_cluster_size_{8};
   int max_cluster_size_{30000};
   double input_timeout_sec_{1.0};
-  double lidar_frame_timeout_sec_{1.0};
-  int max_decay_frames_{100};
-  int decay_num_{1};
+  int input_sync_queue_size_{10};
+  double input_sync_slop_sec_{0.2};
   double tf_timeout_sec_{0.05};
+  bool prefilter_cloud_{false};
+  std::string prefilter_frame_{"base_link"};
+  double prefilter_x_min_{0.0};
+  double prefilter_x_max_{5.0};
+  double prefilter_y_min_{-2.0};
+  double prefilter_y_max_{2.0};
+  double prefilter_z_min_{-0.05};
+  double prefilter_z_max_{2.0};
+  int foreground_cell_size_px_{4};
+  double foreground_depth_margin_m_{0.15};
+  double depth_histogram_bin_size_m_{0.10};
+  int min_depth_bin_points_{8};
+  int depth_bin_neighbor_count_{1};
 
   std::mutex data_mutex_;
   std::condition_variable data_cv_;
-  bool has_mask_{false};
-  bool collecting_{false};
+  bool has_synced_input_{false};
   bool goal_running_{false};
-  int target_decay_frames_{0};
-  cv::Mat latest_mask_;
+  SyncedInput latest_synced_input_;
   sensor_msgs::msg::CameraInfo::SharedPtr camera_info_;
-  DetectionArrayMsg::ConstSharedPtr latest_bboxes_;
-  std::vector<PointCloud2Msg::ConstSharedPtr> decay_clouds_;
 
-  rclcpp::Subscription<MaskMsg>::SharedPtr mask_sub_;
-  rclcpp::Subscription<PointCloud2Msg>::SharedPtr cloud_sub_;
+  message_filters::Subscriber<MaskMsg> mask_sub_;
+  message_filters::Subscriber<PointCloud2Msg> cloud_sub_;
+  message_filters::Subscriber<DetectionArrayMsg> bbox_sub_;
+  std::shared_ptr<InputSynchronizer> input_sync_;
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr
       camera_info_sub_;
-  rclcpp::Subscription<DetectionArrayMsg>::SharedPtr bbox_sub_;
   rclcpp::Publisher<PointCloud2Msg>::SharedPtr filtered_cloud_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr centers_pub_;
   rclcpp::Publisher<PointCloud2Msg>::SharedPtr clustered_cloud_pub_;

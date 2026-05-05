@@ -91,6 +91,7 @@ ament_target_dependencies(table_person_association
 ament_target_dependencies(local_search
   cv_bridge
   geometry_msgs
+  message_filters
   pcl_conversions
   rclcpp
   rclcpp_action

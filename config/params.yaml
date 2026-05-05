@@ -23,22 +23,34 @@ table_person_association:
 local_search:
   ros__parameters:
     mask_topic: "/sam2_segmentation_node/binary_mask/compressed"
-    pointcloud_topic: "/livox/lidar"
+    pointcloud_topic: "/approach/accumulated_cloud"
     camera_info_topic: "/camera/camera_head/color/camera_info"
     bbox_topic: "/detection/bbox_stream"
-    filtered_cloud_topic: "/local_search/points"
-    centers_topic: "/local_search/cluster_centers"
-    clustered_cloud_topic: "/local_search/clustered_points"
-    markers_topic: "/local_search/cluster_markers"
+    filtered_cloud_topic: "~/points"
+    centers_topic: "~/cluster_centers"
+    clustered_cloud_topic: "~/clustered_points"
+    markers_topic: "~/cluster_markers"
     action_name: "local_search"
     camera_frame: "camera_head_color_optical_frame"
     map_frame: "map"
     mask_threshold: 0
-    cluster_tolerance: 0.30
+    cluster_tolerance: 0.20
     min_cluster_size: 8
-    max_cluster_size: 30000
+    max_cluster_size: 3000
     input_timeout_sec: 1.0
-    lidar_frame_timeout_sec: 1.0
-    max_decay_frames: 100
-    decay_num: 5
+    input_sync_queue_size: 10
+    input_sync_slop_sec: 0.2
     tf_timeout_sec: 0.1
+    prefilter_cloud: true
+    prefilter_frame: "base"
+    prefilter_x_min: 0.5
+    prefilter_x_max: 8.0
+    prefilter_y_min: -2.0
+    prefilter_y_max: 2.0
+    prefilter_z_min: 0.3
+    prefilter_z_max: 1.5
+    foreground_cell_size_px: 4
+    foreground_depth_margin_m: 0.15
+    depth_histogram_bin_size_m: 0.10
+    min_depth_bin_points: 8
+    depth_bin_neighbor_count: 1
