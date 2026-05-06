@@ -23,7 +23,7 @@ table_person_association:
 local_search:
   ros__parameters:
     mask_topic: "/sam2_segmentation_node/binary_mask/compressed"
-    pointcloud_topic: "/approach/accumulated_cloud"
+    pointcloud_topic: "/approach/submap_cloud"
     camera_info_topic: "/camera/camera_head/color/camera_info"
     bbox_topic: "/detection/bbox_stream"
     filtered_cloud_topic: "~/points"
