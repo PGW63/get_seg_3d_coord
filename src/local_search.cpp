@@ -108,8 +108,6 @@ public:
         this->declare_parameter<double>("prefilter_z_min", -0.05);
     prefilter_z_max_ =
         this->declare_parameter<double>("prefilter_z_max", 2.0);
-    foreground_cell_size_px_ =
-        this->declare_parameter<int>("foreground_cell_size_px", 4);
     foreground_depth_margin_m_ =
         this->declare_parameter<double>("foreground_depth_margin_m", 0.15);
     depth_histogram_bin_size_m_ =
@@ -118,7 +116,6 @@ public:
         this->declare_parameter<int>("min_depth_bin_points", 8);
     depth_bin_neighbor_count_ =
         this->declare_parameter<int>("depth_bin_neighbor_count", 1);
-    foreground_cell_size_px_ = std::max(1, foreground_cell_size_px_);
     foreground_depth_margin_m_ = std::max(0.0, foreground_depth_margin_m_);
     depth_histogram_bin_size_m_ =
         std::max(0.01, depth_histogram_bin_size_m_);
@@ -215,7 +212,6 @@ private:
   struct ProjectedPointCandidate {
     pcl::PointXYZ point;
     int bbox_index{-1};
-    int cell_index{-1};
     float depth{0.0F};
   };
 
@@ -645,13 +641,8 @@ private:
                   static_cast<double>(camera_info->height)
             : 1.0;
 
-    const int cell_size = std::max(1, foreground_cell_size_px_);
-    const int cell_cols = std::max(1, (mask.cols + cell_size - 1) / cell_size);
-    const int cell_rows = std::max(1, (mask.rows + cell_size - 1) / cell_size);
-    const int cell_count = cell_cols * cell_rows;
     const float inf = std::numeric_limits<float>::infinity();
-    std::vector<std::vector<float>> min_depths(
-        candidates.size(), std::vector<float>(cell_count, inf));
+    std::vector<float> min_depths(candidates.size(), inf);
     std::vector<ProjectedPointCandidate> projected_points;
     projected_points.reserve(lidar_cloud->points.size());
 
@@ -715,16 +706,11 @@ private:
       }
       ++projected_mask_points;
 
-      const int cell_x =
-          std::clamp(u_mask / cell_size, 0, cell_cols - 1);
-      const int cell_y =
-          std::clamp(v_mask / cell_size, 0, cell_rows - 1);
-      const int cell_index = cell_y * cell_cols + cell_x;
       const float depth = camera_point.z();
 
       projected_points.push_back(
-          ProjectedPointCandidate{point, best_bbox, cell_index, depth});
-      float &min_depth = min_depths[best_bbox][cell_index];
+          ProjectedPointCandidate{point, best_bbox, depth});
+      float &min_depth = min_depths[best_bbox];
       if (depth < min_depth) {
         min_depth = depth;
       }
@@ -735,28 +721,24 @@ private:
     }
 
     std::vector<std::vector<float>> foreground_depths(candidates.size());
-    foreground_depths.reserve(candidates.size());
     for (const auto &candidate : projected_points) {
-      const float local_min =
-          min_depths[candidate.bbox_index][candidate.cell_index];
+      const float global_min = min_depths[candidate.bbox_index];
       if (candidate.depth <=
-          local_min + static_cast<float>(foreground_depth_margin_m_)) {
+          global_min + static_cast<float>(foreground_depth_margin_m_)) {
         foreground_depths[candidate.bbox_index].push_back(candidate.depth);
       }
     }
 
     std::vector<int> selected_bins(candidates.size(), -1);
-    std::vector<float> min_depth_by_bbox(candidates.size(), inf);
     for (std::size_t b = 0; b < foreground_depths.size(); ++b) {
       const auto &depths = foreground_depths[b];
       if (depths.empty()) {
         continue;
       }
 
-      const auto minmax = std::minmax_element(depths.begin(), depths.end());
-      const float min_depth = *minmax.first;
-      const float max_depth = *minmax.second;
-      min_depth_by_bbox[b] = min_depth;
+      const float min_depth = min_depths[b];
+      const float max_depth =
+          *std::max_element(depths.begin(), depths.end());
       const int bin_count = std::max(
           1, static_cast<int>(
                  std::floor((max_depth - min_depth) /
@@ -789,21 +771,19 @@ private:
 
     for (const auto &candidate : projected_points) {
       const int bbox_index = candidate.bbox_index;
-      const float local_min =
-          min_depths[bbox_index][candidate.cell_index];
+      const float global_min = min_depths[bbox_index];
       if (candidate.depth >
-          local_min + static_cast<float>(foreground_depth_margin_m_)) {
+          global_min + static_cast<float>(foreground_depth_margin_m_)) {
         continue;
       }
-      if (selected_bins[bbox_index] < 0 ||
-          !std::isfinite(min_depth_by_bbox[bbox_index])) {
+      if (selected_bins[bbox_index] < 0 || !std::isfinite(global_min)) {
         continue;
       }
 
       const int bin = std::max(
           0,
           static_cast<int>(
-              std::floor((candidate.depth - min_depth_by_bbox[bbox_index]) /
+              std::floor((candidate.depth - global_min) /
                          static_cast<float>(depth_histogram_bin_size_m_))));
       if (std::abs(bin - selected_bins[bbox_index]) >
           depth_bin_neighbor_count_) {
@@ -1090,14 +1070,13 @@ private:
   double input_sync_slop_sec_{0.2};
   double tf_timeout_sec_{0.05};
   bool prefilter_cloud_{false};
-  std::string prefilter_frame_{"base_link"};
+  std::string prefilter_frame_{"base"};
   double prefilter_x_min_{0.0};
   double prefilter_x_max_{5.0};
   double prefilter_y_min_{-2.0};
   double prefilter_y_max_{2.0};
   double prefilter_z_min_{-0.05};
   double prefilter_z_max_{2.0};
-  int foreground_cell_size_px_{4};
   double foreground_depth_margin_m_{0.15};
   double depth_histogram_bin_size_m_{0.10};
   int min_depth_bin_points_{8};
