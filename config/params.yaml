@@ -35,7 +35,7 @@ local_search:
     map_frame: "map"
     mask_threshold: 0
     cluster_tolerance: 0.30
-    min_cluster_size: 4
+    min_cluster_size: 3
     max_cluster_size: 3000
     input_sync_queue_size: 10
     input_sync_slop_sec: 0.2
@@ -50,6 +50,6 @@ local_search:
     prefilter_z_max: 1.5
     foreground_depth_margin_m: 0.15
     depth_histogram_bin_size_m: 0.10
-    min_depth_bin_points: 4
+    min_depth_bin_points: 3
     depth_bin_neighbor_count: 1
-    max_distance_from_reference_m: 1.0
+    max_distance_from_reference_m: 1.5
