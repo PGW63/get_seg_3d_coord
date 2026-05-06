@@ -34,22 +34,23 @@ local_search:
     camera_frame: "camera_head_color_optical_frame"
     map_frame: "map"
     mask_threshold: 0
-    cluster_tolerance: 0.20
-    min_cluster_size: 8
+    cluster_tolerance: 0.30
+    min_cluster_size: 4
     max_cluster_size: 3000
     input_timeout_sec: 1.0
     input_sync_queue_size: 10
     input_sync_slop_sec: 0.2
-    tf_timeout_sec: 0.1
+    tf_timeout_sec: 0.2
     prefilter_cloud: true
     prefilter_frame: "base"
     prefilter_x_min: 0.5
-    prefilter_x_max: 8.0
+    prefilter_x_max: 5.0
     prefilter_y_min: -2.0
     prefilter_y_max: 2.0
     prefilter_z_min: 0.3
     prefilter_z_max: 1.5
     foreground_depth_margin_m: 0.15
     depth_histogram_bin_size_m: 0.10
-    min_depth_bin_points: 8
+    min_depth_bin_points: 4
     depth_bin_neighbor_count: 1
+    max_distance_from_reference_m: 1.0

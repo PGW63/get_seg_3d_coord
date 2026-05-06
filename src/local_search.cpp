@@ -116,6 +116,10 @@ public:
         this->declare_parameter<int>("min_depth_bin_points", 8);
     depth_bin_neighbor_count_ =
         this->declare_parameter<int>("depth_bin_neighbor_count", 1);
+    max_distance_from_reference_m_ = this->declare_parameter<double>(
+        "max_distance_from_reference_m", 1.0);
+    max_distance_from_reference_m_ =
+        std::max(0.0, max_distance_from_reference_m_);
     foreground_depth_margin_m_ = std::max(0.0, foreground_depth_margin_m_);
     depth_histogram_bin_size_m_ =
         std::max(0.01, depth_histogram_bin_size_m_);
@@ -364,18 +368,30 @@ private:
                                     static_cast<float>(goal->reference_position.y),
                                     static_cast<float>(goal->reference_position.z));
 
+    const float max_dist_sq =
+        static_cast<float>(max_distance_from_reference_m_ *
+                           max_distance_from_reference_m_);
     int found_count = 0;
+    std::string per_class_diag;
     result->coords.resize(requested_classes.size());
     result->found.resize(requested_classes.size());
     for (std::size_t i = 0; i < requested_classes.size(); ++i) {
       const auto &name = requested_classes[i];
       float best_dist_sq = std::numeric_limits<float>::infinity();
+      float nearest_rejected_dist =
+          std::numeric_limits<float>::infinity();
+      int matching_class_clusters = 0;
       const ClusterResult *best = nullptr;
       for (const auto &cluster : clusters) {
         if (cluster.class_id != name) {
           continue;
         }
+        ++matching_class_clusters;
         const float d = (cluster.center_map - reference).squaredNorm();
+        if (d > max_dist_sq) {
+          if (d < nearest_rejected_dist) nearest_rejected_dist = d;
+          continue;
+        }
         if (d < best_dist_sq) {
           best_dist_sq = d;
           best = &cluster;
@@ -392,6 +408,17 @@ private:
         result->coords[i].y = 0.0;
         result->coords[i].z = 0.0;
         result->found[i] = false;
+        char dbuf[128];
+        if (matching_class_clusters == 0) {
+          std::snprintf(dbuf, sizeof(dbuf), "[%s: no cluster]", name.c_str());
+        } else {
+          std::snprintf(dbuf, sizeof(dbuf),
+                        "[%s: %d cluster(s) but nearest %.2fm > %.2fm gate]",
+                        name.c_str(), matching_class_clusters,
+                        std::sqrt(nearest_rejected_dist),
+                        max_distance_from_reference_m_);
+        }
+        per_class_diag += dbuf;
       }
     }
 
@@ -399,11 +426,11 @@ private:
     goal_handle->publish_feedback(feedback);
 
     goal_running_ = false;
-    char buf[160];
+    char buf[256];
     std::snprintf(buf, sizeof(buf),
-                  "found %d/%zu classes (clusters=%zu, points=%zu)",
+                  "found %d/%zu classes (clusters=%zu, points=%zu) %s",
                   found_count, requested_classes.size(), clusters.size(),
-                  accumulated_cloud->points.size());
+                  accumulated_cloud->points.size(), per_class_diag.c_str());
     result->message = buf;
     result->success = (found_count == static_cast<int>(requested_classes.size()));
     goal_handle->succeed(result);
@@ -794,11 +821,21 @@ private:
       per_point_bbox.push_back(bbox_index);
     }
 
-    RCLCPP_DEBUG(this->get_logger(),
-                 "local_search cloud filter: raw=%zu finite=%zu prefiltered=%zu "
-                 "bbox_mask=%zu final=%zu",
-                 lidar_cloud->points.size(), finite_points, prefiltered_points,
-                 projected_mask_points, accumulated_cloud->points.size());
+    RCLCPP_INFO(this->get_logger(),
+                "local_search cloud filter: raw=%zu finite=%zu prefiltered=%zu "
+                "bbox_mask=%zu final=%zu",
+                lidar_cloud->points.size(), finite_points, prefiltered_points,
+                projected_mask_points, accumulated_cloud->points.size());
+    for (std::size_t b = 0; b < candidates.size(); ++b) {
+      std::size_t bbox_count = 0;
+      for (int bi : per_point_bbox) {
+        if (bi == static_cast<int>(b)) ++bbox_count;
+      }
+      RCLCPP_INFO(this->get_logger(),
+                  "local_search bbox[%zu] class=%s score=%.2f points=%zu",
+                  b, candidates[b].class_id.c_str(), candidates[b].score,
+                  bbox_count);
+    }
   }
 
   std::vector<ClusterResult> clusterPerBBox(
@@ -818,7 +855,43 @@ private:
     for (std::size_t b = 0; b < candidates.size(); ++b) {
       const auto &indices = bins[b];
       if (static_cast<int>(indices.size()) < min_cluster_size_) {
+        RCLCPP_WARN(this->get_logger(),
+                    "local_search bbox[%zu] class=%s skipped: points=%zu < "
+                    "min_cluster_size=%d",
+                    b, candidates[b].class_id.c_str(), indices.size(),
+                    min_cluster_size_);
         continue;
+      }
+
+      {
+        float max_nn_dist = 0.0F;
+        Eigen::Vector3f bb_min(std::numeric_limits<float>::infinity(),
+                               std::numeric_limits<float>::infinity(),
+                               std::numeric_limits<float>::infinity());
+        Eigen::Vector3f bb_max = -bb_min;
+        for (std::size_t i = 0; i < indices.size(); ++i) {
+          const auto &pi = accumulated_cloud->points[indices[i]];
+          bb_min = bb_min.cwiseMin(Eigen::Vector3f(pi.x, pi.y, pi.z));
+          bb_max = bb_max.cwiseMax(Eigen::Vector3f(pi.x, pi.y, pi.z));
+          float min_d = std::numeric_limits<float>::infinity();
+          for (std::size_t j = 0; j < indices.size(); ++j) {
+            if (i == j) continue;
+            const auto &pj = accumulated_cloud->points[indices[j]];
+            const float dx = pi.x - pj.x;
+            const float dy = pi.y - pj.y;
+            const float dz = pi.z - pj.z;
+            const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (d < min_d) min_d = d;
+          }
+          if (min_d > max_nn_dist) max_nn_dist = min_d;
+        }
+        const Eigen::Vector3f spread = bb_max - bb_min;
+        RCLCPP_INFO(this->get_logger(),
+                    "local_search bbox[%zu] class=%s pre-cluster: points=%zu "
+                    "spread=(%.2fx%.2fx%.2f) max_nn_dist=%.3fm tol=%.2fm",
+                    b, candidates[b].class_id.c_str(), indices.size(),
+                    spread.x(), spread.y(), spread.z(), max_nn_dist,
+                    cluster_tolerance_);
       }
 
       auto sub_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
@@ -842,25 +915,35 @@ private:
       extractor.setInputCloud(sub_cloud);
       extractor.extract(cluster_indices);
 
-      if (cluster_indices.empty()) {
-        continue;
-      }
-
-      std::size_t dominant = 0;
-      for (std::size_t k = 1; k < cluster_indices.size(); ++k) {
-        if (cluster_indices[k].indices.size() >
-            cluster_indices[dominant].indices.size()) {
-          dominant = k;
-        }
-      }
-
       ClusterResult cr;
       cr.bbox_index = b;
       cr.class_id = candidates[b].class_id;
       cr.score = candidates[b].score;
-      cr.indices.indices.reserve(cluster_indices[dominant].indices.size());
-      for (int sub_idx : cluster_indices[dominant].indices) {
-        cr.indices.indices.push_back(indices[sub_idx]);
+
+      if (cluster_indices.empty()) {
+        RCLCPP_WARN(this->get_logger(),
+                    "local_search bbox[%zu] class=%s PCL clustering yielded 0 "
+                    "clusters from %zu points (tol=%.2f); using all points as "
+                    "fallback",
+                    b, candidates[b].class_id.c_str(), indices.size(),
+                    cluster_tolerance_);
+        cr.indices.indices = indices;
+      } else {
+        std::size_t dominant = 0;
+        for (std::size_t k = 1; k < cluster_indices.size(); ++k) {
+          if (cluster_indices[k].indices.size() >
+              cluster_indices[dominant].indices.size()) {
+            dominant = k;
+          }
+        }
+        cr.indices.indices.reserve(cluster_indices[dominant].indices.size());
+        for (int sub_idx : cluster_indices[dominant].indices) {
+          cr.indices.indices.push_back(indices[sub_idx]);
+        }
+        RCLCPP_INFO(this->get_logger(),
+                    "local_search bbox[%zu] class=%s clusters=%zu dominant=%zu",
+                    b, candidates[b].class_id.c_str(), cluster_indices.size(),
+                    cluster_indices[dominant].indices.size());
       }
 
       Eigen::Vector4f centroid;
@@ -1081,6 +1164,7 @@ private:
   double depth_histogram_bin_size_m_{0.10};
   int min_depth_bin_points_{8};
   int depth_bin_neighbor_count_{1};
+  double max_distance_from_reference_m_{1.0};
 
   std::mutex data_mutex_;
   std::condition_variable data_cv_;
