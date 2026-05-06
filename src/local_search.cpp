@@ -81,8 +81,8 @@ public:
     map_frame_ = this->declare_parameter<std::string>("map_frame", "map");
     mask_threshold_ = this->declare_parameter<int>("mask_threshold", 0);
     cluster_tolerance_ =
-        this->declare_parameter<double>("cluster_tolerance", 0.05);
-    min_cluster_size_ = this->declare_parameter<int>("min_cluster_size", 8);
+        this->declare_parameter<double>("cluster_tolerance", 0.3);
+    min_cluster_size_ = this->declare_parameter<int>("min_cluster_size", 3);
     max_cluster_size_ =
         this->declare_parameter<int>("max_cluster_size", 30000);
     input_sync_queue_size_ =
@@ -93,7 +93,7 @@ public:
     prefilter_cloud_ =
         this->declare_parameter<bool>("prefilter_cloud", false);
     prefilter_frame_ =
-        this->declare_parameter<std::string>("prefilter_frame", "base_link");
+        this->declare_parameter<std::string>("prefilter_frame", "base");
     prefilter_x_min_ =
         this->declare_parameter<double>("prefilter_x_min", 0.0);
     prefilter_x_max_ =
@@ -111,11 +111,11 @@ public:
     depth_histogram_bin_size_m_ =
         this->declare_parameter<double>("depth_histogram_bin_size_m", 0.10);
     min_depth_bin_points_ =
-        this->declare_parameter<int>("min_depth_bin_points", 8);
+        this->declare_parameter<int>("min_depth_bin_points", 3);
     depth_bin_neighbor_count_ =
         this->declare_parameter<int>("depth_bin_neighbor_count", 1);
     max_distance_from_reference_m_ = this->declare_parameter<double>(
-        "max_distance_from_reference_m", 1.0);
+        "max_distance_from_reference_m", 1.5);
     max_distance_from_reference_m_ =
         std::max(0.0, max_distance_from_reference_m_);
     foreground_depth_margin_m_ = std::max(0.0, foreground_depth_margin_m_);
