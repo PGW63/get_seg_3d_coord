@@ -85,8 +85,6 @@ public:
     min_cluster_size_ = this->declare_parameter<int>("min_cluster_size", 8);
     max_cluster_size_ =
         this->declare_parameter<int>("max_cluster_size", 30000);
-    input_timeout_sec_ =
-        this->declare_parameter<double>("input_timeout_sec", 1.0);
     input_sync_queue_size_ =
         this->declare_parameter<int>("input_sync_queue_size", 10);
     input_sync_slop_sec_ =
@@ -271,6 +269,10 @@ private:
     feedback->current_num = 0;
     goal_handle->publish_feedback(feedback);
 
+    const auto requested_classes = std::vector<std::string>(
+        goal->class_names.begin(), goal->class_names.end());
+    const rclcpp::Time goal_start_stamp = this->now();
+
     cv::Mat mask;
     std_msgs::msg::Header mask_header;
     sensor_msgs::msg::CameraInfo::SharedPtr camera_info;
@@ -279,11 +281,26 @@ private:
 
     {
       std::unique_lock<std::mutex> lock(data_mutex_);
-      const bool ready = data_cv_.wait_for(
-          lock, std::chrono::duration<double>(input_timeout_sec_),
-          [this, &goal_handle]() {
-            return goal_handle->is_canceling() ||
-                   (has_synced_input_ && camera_info_ != nullptr);
+      data_cv_.wait(
+          lock,
+          [this, &goal_handle, &goal_start_stamp, &requested_classes]() {
+            if (goal_handle->is_canceling()) return true;
+            if (!has_synced_input_ || camera_info_ == nullptr) return false;
+            const auto &bm = latest_synced_input_.bbox_msg;
+            const auto &cm = latest_synced_input_.cloud_msg;
+            if (!bm || !cm) return false;
+            const rclcpp::Time bbox_stamp(bm->header.stamp);
+            if (bbox_stamp < goal_start_stamp) return false;
+            for (const auto &det : bm->detections) {
+              if (det.results.empty()) continue;
+              const auto &cid = det.results.front().hypothesis.class_id;
+              if (std::find(requested_classes.begin(),
+                            requested_classes.end(),
+                            cid) != requested_classes.end()) {
+                return true;
+              }
+            }
+            return false;
           });
 
       if (goal_handle->is_canceling()) {
@@ -291,26 +308,6 @@ private:
         result->success = false;
         result->message = "canceled";
         goal_handle->canceled(result);
-        return;
-      }
-      if (!ready) {
-        abortGoal(goal_handle, result, "input timeout");
-        return;
-      }
-      if (!camera_info_) {
-        abortGoal(goal_handle, result, "no camera info");
-        return;
-      }
-      if (!has_synced_input_) {
-        abortGoal(goal_handle, result, "no synced inputs");
-        return;
-      }
-      if (!latest_synced_input_.bbox_msg) {
-        abortGoal(goal_handle, result, "no detections");
-        return;
-      }
-      if (!latest_synced_input_.cloud_msg) {
-        abortGoal(goal_handle, result, "no accumulated cloud");
         return;
       }
 
@@ -335,8 +332,6 @@ private:
     feedback->state = "CLUSTER";
     goal_handle->publish_feedback(feedback);
 
-    const auto requested_classes = std::vector<std::string>(
-        goal->class_names.begin(), goal->class_names.end());
     const auto candidates =
         buildBBoxCandidates(*bbox_msg, requested_classes, *camera_info, mask);
 
@@ -1148,7 +1143,6 @@ private:
   double cluster_tolerance_{0.30};
   int min_cluster_size_{8};
   int max_cluster_size_{30000};
-  double input_timeout_sec_{1.0};
   int input_sync_queue_size_{10};
   double input_sync_slop_sec_{0.2};
   double tf_timeout_sec_{0.05};

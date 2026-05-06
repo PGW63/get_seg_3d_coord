@@ -37,7 +37,6 @@ local_search:
     cluster_tolerance: 0.30
     min_cluster_size: 4
     max_cluster_size: 3000
-    input_timeout_sec: 1.0
     input_sync_queue_size: 10
     input_sync_slop_sec: 0.2
     tf_timeout_sec: 0.2
