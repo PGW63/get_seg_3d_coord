@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <functional>
 #include <iterator>
 #include <limits>
@@ -61,7 +62,7 @@ public:
     mask_topic_ = this->declare_parameter<std::string>(
         "mask_topic", "/sam2_segmentation_node/binary_mask/compressed");
     pointcloud_topic_ = this->declare_parameter<std::string>(
-        "pointcloud_topic", "/approach/accumulated_cloud");
+        "pointcloud_topic", "/livox/lidar");
     camera_info_topic_ = this->declare_parameter<std::string>(
         "camera_info_topic", "/camera/camera_head/color/camera_info");
     bbox_topic_ = this->declare_parameter<std::string>(
@@ -106,23 +107,16 @@ public:
         this->declare_parameter<double>("prefilter_z_min", -0.05);
     prefilter_z_max_ =
         this->declare_parameter<double>("prefilter_z_max", 2.0);
-    foreground_depth_margin_m_ =
-        this->declare_parameter<double>("foreground_depth_margin_m", 0.15);
-    depth_histogram_bin_size_m_ =
-        this->declare_parameter<double>("depth_histogram_bin_size_m", 0.10);
-    min_depth_bin_points_ =
-        this->declare_parameter<int>("min_depth_bin_points", 3);
-    depth_bin_neighbor_count_ =
-        this->declare_parameter<int>("depth_bin_neighbor_count", 1);
+    accumulate_frames_ =
+        this->declare_parameter<int>("accumulate_frames", 10);
+    accumulate_timeout_sec_ =
+        this->declare_parameter<double>("accumulate_timeout_sec", 3.0);
     max_distance_from_reference_m_ = this->declare_parameter<double>(
         "max_distance_from_reference_m", 1.5);
     max_distance_from_reference_m_ =
         std::max(0.0, max_distance_from_reference_m_);
-    foreground_depth_margin_m_ = std::max(0.0, foreground_depth_margin_m_);
-    depth_histogram_bin_size_m_ =
-        std::max(0.01, depth_histogram_bin_size_m_);
-    min_depth_bin_points_ = std::max(1, min_depth_bin_points_);
-    depth_bin_neighbor_count_ = std::max(0, depth_bin_neighbor_count_);
+    accumulate_frames_ = std::max(1, accumulate_frames_);
+    accumulate_timeout_sec_ = std::max(0.1, accumulate_timeout_sec_);
     input_sync_queue_size_ = std::max(1, input_sync_queue_size_);
     input_sync_slop_sec_ = std::max(0.0, input_sync_slop_sec_);
     if (prefilter_x_min_ > prefilter_x_max_) {
@@ -139,21 +133,22 @@ public:
     auto reliable_qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
 
     mask_sub_.subscribe(this, mask_topic_, best_effort_qos.get_rmw_qos_profile());
-    cloud_sub_.subscribe(this, pointcloud_topic_,
-                         best_effort_qos.get_rmw_qos_profile());
     bbox_sub_.subscribe(this, bbox_topic_, reliable_qos.get_rmw_qos_profile());
     input_sync_ =
         std::make_shared<InputSynchronizer>(InputSyncPolicy(input_sync_queue_size_),
-                                            mask_sub_, cloud_sub_, bbox_sub_);
+                                            mask_sub_, bbox_sub_);
     input_sync_->setMaxIntervalDuration(
         rclcpp::Duration::from_seconds(input_sync_slop_sec_));
     input_sync_->registerCallback(
         std::bind(&LocalSearchActionServer::syncedInputCallback, this,
-                  std::placeholders::_1, std::placeholders::_2,
-                  std::placeholders::_3));
+                  std::placeholders::_1, std::placeholders::_2));
     camera_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
         camera_info_topic_, reliable_qos,
         std::bind(&LocalSearchActionServer::cameraInfoCallback, this,
+                  std::placeholders::_1));
+    cloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+        pointcloud_topic_, best_effort_qos,
+        std::bind(&LocalSearchActionServer::cloudCallback, this,
                   std::placeholders::_1));
 
     filtered_cloud_pub_ =
@@ -178,10 +173,10 @@ public:
 
     RCLCPP_INFO(this->get_logger(),
                 "LocalSearch action node started. action=%s, mask=%s, "
-                "cloud=%s, camera_info=%s, bbox=%s",
+                "cloud=%s, camera_info=%s, bbox=%s, accumulate_frames=%d",
                 action_name_.c_str(), mask_topic_.c_str(),
                 pointcloud_topic_.c_str(), camera_info_topic_.c_str(),
-                bbox_topic_.c_str());
+                bbox_topic_.c_str(), accumulate_frames_);
   }
 
 private:
@@ -189,7 +184,7 @@ private:
   using PointCloud2Msg = sensor_msgs::msg::PointCloud2;
   using DetectionArrayMsg = vision_msgs::msg::Detection2DArray;
   using InputSyncPolicy =
-      message_filters::sync_policies::ApproximateTime<MaskMsg, PointCloud2Msg,
+      message_filters::sync_policies::ApproximateTime<MaskMsg,
                                                        DetectionArrayMsg>;
   using InputSynchronizer = message_filters::Synchronizer<InputSyncPolicy>;
 
@@ -211,16 +206,9 @@ private:
     pcl::PointIndices indices;
   };
 
-  struct ProjectedPointCandidate {
-    pcl::PointXYZ point;
-    int bbox_index{-1};
-    float depth{0.0F};
-  };
-
   struct SyncedInput {
     cv::Mat mask;
     std_msgs::msg::Header mask_header;
-    PointCloud2Msg::ConstSharedPtr cloud_msg;
     DetectionArrayMsg::ConstSharedPtr bbox_msg;
   };
 
@@ -277,7 +265,6 @@ private:
     std_msgs::msg::Header mask_header;
     sensor_msgs::msg::CameraInfo::SharedPtr camera_info;
     DetectionArrayMsg::ConstSharedPtr bbox_msg;
-    PointCloud2Msg::ConstSharedPtr cloud_msg;
 
     {
       std::unique_lock<std::mutex> lock(data_mutex_);
@@ -287,8 +274,7 @@ private:
             if (goal_handle->is_canceling()) return true;
             if (!has_synced_input_ || camera_info_ == nullptr) return false;
             const auto &bm = latest_synced_input_.bbox_msg;
-            const auto &cm = latest_synced_input_.cloud_msg;
-            if (!bm || !cm) return false;
+            if (!bm) return false;
             const rclcpp::Time bbox_stamp(bm->header.stamp);
             if (bbox_stamp < goal_start_stamp) return false;
             for (const auto &det : bm->detections) {
@@ -315,17 +301,47 @@ private:
       mask_header = latest_synced_input_.mask_header;
       camera_info = camera_info_;
       bbox_msg = latest_synced_input_.bbox_msg;
-      cloud_msg = latest_synced_input_.cloud_msg;
     }
 
-    feedback->state = "PROJECT_ACCUMULATED_CLOUD";
+    feedback->state = "ACCUMULATE_LIDAR";
     goal_handle->publish_feedback(feedback);
+
+    const rclcpp::Time accumulation_start_stamp = this->now();
+    std::vector<PointCloud2Msg::ConstSharedPtr> collected_clouds;
+    collected_clouds.reserve(accumulate_frames_);
+    {
+      std::unique_lock<std::mutex> lock(data_mutex_);
+      const auto deadline =
+          std::chrono::steady_clock::now() +
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::duration<double>(accumulate_timeout_sec_));
+      while (static_cast<int>(collected_clouds.size()) < accumulate_frames_ &&
+             !goal_handle->is_canceling()) {
+        if (!cloud_queue_.empty()) {
+          auto cm = cloud_queue_.front();
+          cloud_queue_.pop_front();
+          const rclcpp::Time cstamp(cm->header.stamp);
+          if (cstamp >= accumulation_start_stamp) {
+            collected_clouds.push_back(cm);
+          }
+          continue;
+        }
+        if (data_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+          break;
+        }
+      }
+    }
 
     if (goal_handle->is_canceling()) {
       goal_running_ = false;
       result->success = false;
       result->message = "canceled";
       goal_handle->canceled(result);
+      return;
+    }
+
+    if (collected_clouds.empty()) {
+      abortGoal(goal_handle, result, "no livox frames collected within timeout");
       return;
     }
 
@@ -336,22 +352,25 @@ private:
         buildBBoxCandidates(*bbox_msg, requested_classes, *camera_info, mask);
 
     auto accumulated_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-    std::vector<int> per_point_bbox(0);
-    const rclcpp::Time projection_stamp =
-        selectProjectionStamp(mask_header, *bbox_msg, *camera_info, *cloud_msg);
-    accumulateAndAssign(cloud_msg, camera_info, mask, candidates,
-                        projection_stamp,
-                        accumulated_cloud, per_point_bbox);
+    std::vector<int> per_point_bbox;
+    for (const auto &cm : collected_clouds) {
+      collectFromOneFrame(cm, camera_info, mask, candidates,
+                          accumulated_cloud, per_point_bbox);
+    }
+    accumulated_cloud->width =
+        static_cast<std::uint32_t>(accumulated_cloud->points.size());
+    accumulated_cloud->height = 1;
+    accumulated_cloud->is_dense = false;
 
     std::vector<ClusterResult> clusters =
         clusterPerBBox(accumulated_cloud, per_point_bbox, candidates);
 
-    const auto output_header = cloud_msg->header;
-    const std::string lidar_frame = output_header.frame_id;
+    std_msgs::msg::Header output_header;
+    output_header.stamp = collected_clouds.back()->header.stamp;
+    output_header.frame_id = map_frame_;
 
-    if (!transformCentersToMap(clusters, lidar_frame, output_header.stamp)) {
-      abortGoal(goal_handle, result, "tf to map failed");
-      return;
+    for (auto &c : clusters) {
+      c.center_map = c.center_lidar;
     }
 
     publishFilteredCloud(output_header, accumulated_cloud);
@@ -363,9 +382,12 @@ private:
                                     static_cast<float>(goal->reference_position.y),
                                     static_cast<float>(goal->reference_position.z));
 
+    const double effective_max_distance =
+        goal->max_distance > 0.0F
+            ? static_cast<double>(goal->max_distance)
+            : max_distance_from_reference_m_;
     const float max_dist_sq =
-        static_cast<float>(max_distance_from_reference_m_ *
-                           max_distance_from_reference_m_);
+        static_cast<float>(effective_max_distance * effective_max_distance);
     int found_count = 0;
     std::string per_class_diag;
     result->coords.resize(requested_classes.size());
@@ -411,7 +433,7 @@ private:
                         "[%s: %d cluster(s) but nearest %.2fm > %.2fm gate]",
                         name.c_str(), matching_class_clusters,
                         std::sqrt(nearest_rejected_dist),
-                        max_distance_from_reference_m_);
+                        effective_max_distance);
         }
         per_class_diag += dbuf;
       }
@@ -423,9 +445,10 @@ private:
     goal_running_ = false;
     char buf[256];
     std::snprintf(buf, sizeof(buf),
-                  "found %d/%zu classes (clusters=%zu, points=%zu) %s",
+                  "found %d/%zu classes (clusters=%zu, points=%zu, frames=%zu) %s",
                   found_count, requested_classes.size(), clusters.size(),
-                  accumulated_cloud->points.size(), per_class_diag.c_str());
+                  accumulated_cloud->points.size(), collected_clouds.size(),
+                  per_class_diag.c_str());
     result->message = buf;
     result->success = (found_count == static_cast<int>(requested_classes.size()));
     goal_handle->succeed(result);
@@ -486,7 +509,6 @@ private:
   }
 
   void syncedInputCallback(const MaskMsg::ConstSharedPtr mask_msg,
-                           const PointCloud2Msg::ConstSharedPtr cloud_msg,
                            const DetectionArrayMsg::ConstSharedPtr bbox_msg) {
     cv::Mat mask = imageToBinaryMask(mask_msg);
     if (mask.empty()) {
@@ -497,7 +519,6 @@ private:
       std::lock_guard<std::mutex> lock(data_mutex_);
       latest_synced_input_.mask = mask;
       latest_synced_input_.mask_header = mask_msg->header;
-      latest_synced_input_.cloud_msg = cloud_msg;
       latest_synced_input_.bbox_msg = bbox_msg;
       has_synced_input_ = true;
     }
@@ -512,25 +533,16 @@ private:
     data_cv_.notify_all();
   }
 
-  bool hasValidStamp(const builtin_interfaces::msg::Time &stamp) const {
-    return stamp.sec != 0 || stamp.nanosec != 0U;
-  }
-
-  rclcpp::Time selectProjectionStamp(
-      const std_msgs::msg::Header &mask_header,
-      const DetectionArrayMsg &bbox_msg,
-      const sensor_msgs::msg::CameraInfo &camera_info,
-      const PointCloud2Msg &cloud_msg) const {
-    if (hasValidStamp(mask_header.stamp)) {
-      return rclcpp::Time(mask_header.stamp);
+  void cloudCallback(const PointCloud2Msg::ConstSharedPtr msg) {
+    {
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      cloud_queue_.push_back(msg);
+      while (cloud_queue_.size() >
+             static_cast<std::size_t>(cloud_queue_max_size_)) {
+        cloud_queue_.pop_front();
+      }
     }
-    if (hasValidStamp(bbox_msg.header.stamp)) {
-      return rclcpp::Time(bbox_msg.header.stamp);
-    }
-    if (hasValidStamp(camera_info.header.stamp)) {
-      return rclcpp::Time(camera_info.header.stamp);
-    }
-    return rclcpp::Time(cloud_msg.header.stamp);
+    data_cv_.notify_all();
   }
 
   cv::Mat imageToBinaryMask(const MaskMsg::ConstSharedPtr &mask_msg) {
@@ -570,33 +582,11 @@ private:
     return binary;
   }
 
-  void accumulateAndAssign(
-      const PointCloud2Msg::ConstSharedPtr &cloud_msg,
-      const sensor_msgs::msg::CameraInfo::SharedPtr &camera_info,
-      const cv::Mat &mask,
-      const std::vector<BBoxCandidate> &candidates,
-      const rclcpp::Time &projection_stamp,
-      pcl::PointCloud<pcl::PointXYZ>::Ptr &accumulated_cloud,
-      std::vector<int> &per_point_bbox) {
-    accumulated_cloud->points.clear();
-    per_point_bbox.clear();
-
-    collectFromOneFrame(cloud_msg, camera_info, mask, candidates,
-                        projection_stamp,
-                        accumulated_cloud, per_point_bbox);
-
-    accumulated_cloud->width =
-        static_cast<std::uint32_t>(accumulated_cloud->points.size());
-    accumulated_cloud->height = 1;
-    accumulated_cloud->is_dense = false;
-  }
-
   void collectFromOneFrame(
       const PointCloud2Msg::ConstSharedPtr &cloud_msg,
       const sensor_msgs::msg::CameraInfo::SharedPtr &camera_info,
       const cv::Mat &mask,
       const std::vector<BBoxCandidate> &candidates,
-      const rclcpp::Time &projection_stamp,
       pcl::PointCloud<pcl::PointXYZ>::Ptr &accumulated_cloud,
       std::vector<int> &per_point_bbox) {
     auto lidar_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
@@ -614,10 +604,11 @@ private:
       return;
     }
 
+    const rclcpp::Time frame_stamp(cloud_msg->header.stamp);
     geometry_msgs::msg::TransformStamped transform;
     try {
       transform = tf_buffer_.lookupTransform(
-          camera_frame, cloud_msg->header.frame_id, projection_stamp,
+          camera_frame, cloud_msg->header.frame_id, frame_stamp,
           rclcpp::Duration::from_seconds(tf_timeout_sec_));
     } catch (const tf2::TransformException &ex) {
       RCLCPP_WARN_THROTTLE(
@@ -627,6 +618,27 @@ private:
       return;
     }
 
+    const std::string output_frame = map_frame_;
+    if (accumulated_cloud->header.frame_id.empty()) {
+      accumulated_cloud->header.frame_id = output_frame;
+    }
+    Eigen::Isometry3f lidar_to_output = Eigen::Isometry3f::Identity();
+    if (output_frame != cloud_msg->header.frame_id) {
+      try {
+        const auto out_tf = tf_buffer_.lookupTransform(
+            output_frame, cloud_msg->header.frame_id, frame_stamp,
+            rclcpp::Duration::from_seconds(tf_timeout_sec_));
+        lidar_to_output = transformToEigen(out_tf.transform);
+      } catch (const tf2::TransformException &ex) {
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 2000,
+            "Cannot transform cloud frame '%s' to output frame '%s': %s",
+            cloud_msg->header.frame_id.c_str(), output_frame.c_str(),
+            ex.what());
+        return;
+      }
+    }
+
     const Eigen::Isometry3f lidar_to_camera =
         transformToEigen(transform.transform);
     Eigen::Isometry3f lidar_to_prefilter = Eigen::Isometry3f::Identity();
@@ -634,7 +646,7 @@ private:
     if (prefilter_cloud_ && !prefilter_frame_.empty()) {
       try {
         const auto prefilter_tf = tf_buffer_.lookupTransform(
-            prefilter_frame_, cloud_msg->header.frame_id, projection_stamp,
+            prefilter_frame_, cloud_msg->header.frame_id, frame_stamp,
             rclcpp::Duration::from_seconds(tf_timeout_sec_));
         lidar_to_prefilter = transformToEigen(prefilter_tf.transform);
         use_prefilter = true;
@@ -662,11 +674,6 @@ private:
             ? static_cast<double>(mask.rows) /
                   static_cast<double>(camera_info->height)
             : 1.0;
-
-    const float inf = std::numeric_limits<float>::infinity();
-    std::vector<float> min_depths(candidates.size(), inf);
-    std::vector<ProjectedPointCandidate> projected_points;
-    projected_points.reserve(lidar_cloud->points.size());
 
     std::size_t finite_points = 0;
     std::size_t prefiltered_points = 0;
@@ -728,109 +735,20 @@ private:
       }
       ++projected_mask_points;
 
-      const float depth = camera_point.z();
-
-      projected_points.push_back(
-          ProjectedPointCandidate{point, best_bbox, depth});
-      float &min_depth = min_depths[best_bbox];
-      if (depth < min_depth) {
-        min_depth = depth;
-      }
-    }
-
-    if (projected_points.empty()) {
-      return;
-    }
-
-    std::vector<std::vector<float>> foreground_depths(candidates.size());
-    for (const auto &candidate : projected_points) {
-      const float global_min = min_depths[candidate.bbox_index];
-      if (candidate.depth <=
-          global_min + static_cast<float>(foreground_depth_margin_m_)) {
-        foreground_depths[candidate.bbox_index].push_back(candidate.depth);
-      }
-    }
-
-    std::vector<int> selected_bins(candidates.size(), -1);
-    for (std::size_t b = 0; b < foreground_depths.size(); ++b) {
-      const auto &depths = foreground_depths[b];
-      if (depths.empty()) {
-        continue;
-      }
-
-      const float min_depth = min_depths[b];
-      const float max_depth =
-          *std::max_element(depths.begin(), depths.end());
-      const int bin_count = std::max(
-          1, static_cast<int>(
-                 std::floor((max_depth - min_depth) /
-                            static_cast<float>(depth_histogram_bin_size_m_))) +
-                 1);
-      std::vector<int> counts(bin_count, 0);
-      for (const float depth : depths) {
-        const int bin = std::clamp(
-            static_cast<int>(
-                std::floor((depth - min_depth) /
-                           static_cast<float>(depth_histogram_bin_size_m_))),
-            0, bin_count - 1);
-        ++counts[bin];
-      }
-
-      int selected_bin = -1;
-      for (int bin = 0; bin < bin_count; ++bin) {
-        if (counts[bin] >= min_depth_bin_points_) {
-          selected_bin = bin;
-          break;
-        }
-      }
-      if (selected_bin < 0) {
-        selected_bin = static_cast<int>(
-            std::distance(counts.begin(),
-                          std::max_element(counts.begin(), counts.end())));
-      }
-      selected_bins[b] = selected_bin;
-    }
-
-    for (const auto &candidate : projected_points) {
-      const int bbox_index = candidate.bbox_index;
-      const float global_min = min_depths[bbox_index];
-      if (candidate.depth >
-          global_min + static_cast<float>(foreground_depth_margin_m_)) {
-        continue;
-      }
-      if (selected_bins[bbox_index] < 0 || !std::isfinite(global_min)) {
-        continue;
-      }
-
-      const int bin = std::max(
-          0,
-          static_cast<int>(
-              std::floor((candidate.depth - global_min) /
-                         static_cast<float>(depth_histogram_bin_size_m_))));
-      if (std::abs(bin - selected_bins[bbox_index]) >
-          depth_bin_neighbor_count_) {
-        continue;
-      }
-
-      accumulated_cloud->points.push_back(candidate.point);
-      per_point_bbox.push_back(bbox_index);
+      const Eigen::Vector3f output_point = lidar_to_output * lidar_point;
+      pcl::PointXYZ out;
+      out.x = output_point.x();
+      out.y = output_point.y();
+      out.z = output_point.z();
+      accumulated_cloud->points.push_back(out);
+      per_point_bbox.push_back(best_bbox);
     }
 
     RCLCPP_INFO(this->get_logger(),
-                "local_search cloud filter: raw=%zu finite=%zu prefiltered=%zu "
-                "bbox_mask=%zu final=%zu",
+                "local_search cloud frame: raw=%zu finite=%zu prefiltered=%zu "
+                "bbox_mask=%zu cumulative=%zu",
                 lidar_cloud->points.size(), finite_points, prefiltered_points,
                 projected_mask_points, accumulated_cloud->points.size());
-    for (std::size_t b = 0; b < candidates.size(); ++b) {
-      std::size_t bbox_count = 0;
-      for (int bi : per_point_bbox) {
-        if (bi == static_cast<int>(b)) ++bbox_count;
-      }
-      RCLCPP_INFO(this->get_logger(),
-                  "local_search bbox[%zu] class=%s score=%.2f points=%zu",
-                  b, candidates[b].class_id.c_str(), candidates[b].score,
-                  bbox_count);
-    }
   }
 
   std::vector<ClusterResult> clusterPerBBox(
@@ -856,37 +774,6 @@ private:
                     b, candidates[b].class_id.c_str(), indices.size(),
                     min_cluster_size_);
         continue;
-      }
-
-      {
-        float max_nn_dist = 0.0F;
-        Eigen::Vector3f bb_min(std::numeric_limits<float>::infinity(),
-                               std::numeric_limits<float>::infinity(),
-                               std::numeric_limits<float>::infinity());
-        Eigen::Vector3f bb_max = -bb_min;
-        for (std::size_t i = 0; i < indices.size(); ++i) {
-          const auto &pi = accumulated_cloud->points[indices[i]];
-          bb_min = bb_min.cwiseMin(Eigen::Vector3f(pi.x, pi.y, pi.z));
-          bb_max = bb_max.cwiseMax(Eigen::Vector3f(pi.x, pi.y, pi.z));
-          float min_d = std::numeric_limits<float>::infinity();
-          for (std::size_t j = 0; j < indices.size(); ++j) {
-            if (i == j) continue;
-            const auto &pj = accumulated_cloud->points[indices[j]];
-            const float dx = pi.x - pj.x;
-            const float dy = pi.y - pj.y;
-            const float dz = pi.z - pj.z;
-            const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
-            if (d < min_d) min_d = d;
-          }
-          if (min_d > max_nn_dist) max_nn_dist = min_d;
-        }
-        const Eigen::Vector3f spread = bb_max - bb_min;
-        RCLCPP_INFO(this->get_logger(),
-                    "local_search bbox[%zu] class=%s pre-cluster: points=%zu "
-                    "spread=(%.2fx%.2fx%.2f) max_nn_dist=%.3fm tol=%.2fm",
-                    b, candidates[b].class_id.c_str(), indices.size(),
-                    spread.x(), spread.y(), spread.z(), max_nn_dist,
-                    cluster_tolerance_);
       }
 
       auto sub_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
@@ -947,37 +834,6 @@ private:
       results.push_back(std::move(cr));
     }
     return results;
-  }
-
-  bool transformCentersToMap(std::vector<ClusterResult> &clusters,
-                             const std::string &lidar_frame,
-                             const rclcpp::Time &stamp) const {
-    if (clusters.empty()) {
-      return true;
-    }
-    if (lidar_frame == map_frame_) {
-      for (auto &c : clusters) {
-        c.center_map = c.center_lidar;
-      }
-      return true;
-    }
-    geometry_msgs::msg::TransformStamped tf_msg;
-    try {
-      tf_msg = tf_buffer_.lookupTransform(
-          map_frame_, lidar_frame, stamp,
-          rclcpp::Duration::from_seconds(tf_timeout_sec_));
-    } catch (const tf2::TransformException &ex) {
-      RCLCPP_WARN(this->get_logger(),
-                  "Cannot transform '%s' -> '%s': %s", lidar_frame.c_str(),
-                  map_frame_.c_str(), ex.what());
-      return false;
-    }
-    const Eigen::Isometry3f lidar_to_map =
-        transformToEigen(tf_msg.transform);
-    for (auto &c : clusters) {
-      c.center_map = lidar_to_map * c.center_lidar;
-    }
-    return true;
   }
 
   void publishFilteredCloud(
@@ -1154,10 +1010,9 @@ private:
   double prefilter_y_max_{2.0};
   double prefilter_z_min_{-0.05};
   double prefilter_z_max_{2.0};
-  double foreground_depth_margin_m_{0.15};
-  double depth_histogram_bin_size_m_{0.10};
-  int min_depth_bin_points_{8};
-  int depth_bin_neighbor_count_{1};
+  int accumulate_frames_{10};
+  double accumulate_timeout_sec_{3.0};
+  int cloud_queue_max_size_{60};
   double max_distance_from_reference_m_{1.0};
 
   std::mutex data_mutex_;
@@ -1166,13 +1021,14 @@ private:
   bool goal_running_{false};
   SyncedInput latest_synced_input_;
   sensor_msgs::msg::CameraInfo::SharedPtr camera_info_;
+  std::deque<PointCloud2Msg::ConstSharedPtr> cloud_queue_;
 
   message_filters::Subscriber<MaskMsg> mask_sub_;
-  message_filters::Subscriber<PointCloud2Msg> cloud_sub_;
   message_filters::Subscriber<DetectionArrayMsg> bbox_sub_;
   std::shared_ptr<InputSynchronizer> input_sync_;
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr
       camera_info_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
   rclcpp::Publisher<PointCloud2Msg>::SharedPtr filtered_cloud_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr centers_pub_;
   rclcpp::Publisher<PointCloud2Msg>::SharedPtr clustered_cloud_pub_;
