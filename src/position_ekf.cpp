@@ -2,6 +2,8 @@
 
 #include <algorithm>
 
+#include <Eigen/LU>
+
 namespace get_seg_3d_coord {
 
 void PositionEkf::reset() {

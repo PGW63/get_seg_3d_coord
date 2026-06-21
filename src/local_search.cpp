@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <ctime>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -59,6 +60,27 @@
 #include "get_seg_3d_coord/position_ekf.hpp"
 #include "get_seg_3d_coord/state_odometry.hpp"
 #include "inha_interfaces/action/local_search.hpp"
+
+namespace {
+
+std::string formatActionIdKst(const rclcpp::Time &stamp) {
+  constexpr std::int64_t kNanosecondsPerSecond = 1000000000LL;
+  constexpr std::int64_t kKstOffsetSeconds = 9LL * 60LL * 60LL;
+  const std::int64_t stamp_ns = stamp.nanoseconds();
+  const std::time_t kst_seconds = static_cast<std::time_t>(
+      stamp_ns / kNanosecondsPerSecond + kKstOffsetSeconds);
+  const std::int64_t milliseconds =
+      (stamp_ns % kNanosecondsPerSecond) / 1000000LL;
+  std::tm kst_time{};
+  gmtime_r(&kst_seconds, &kst_time);
+
+  std::ostringstream out;
+  out << "action_" << std::put_time(&kst_time, "%Y%m%d_%H%M%S") << "_"
+      << std::setw(3) << std::setfill('0') << milliseconds << "_KST";
+  return out.str();
+}
+
+}  // namespace
 
 class LocalSearchActionServer : public rclcpp::Node {
 public:
@@ -311,6 +333,7 @@ private:
     const auto requested_classes = std::vector<std::string>(
         goal->class_names.begin(), goal->class_names.end());
     const rclcpp::Time goal_start_stamp = this->now();
+    const std::string action_id = formatActionIdKst(goal_start_stamp);
     const Eigen::Vector3f reference(static_cast<float>(goal->reference_position.x),
                                     static_cast<float>(goal->reference_position.y),
                                     static_cast<float>(goal->reference_position.z));
@@ -347,7 +370,7 @@ private:
       const bool got_measurement = collectMeasurementBatch(
           goal_handle, requested_classes, min_input_stamp, reference,
           effective_max_distance, ekf_deadline, &batch, &min_input_stamp);
-      publishFrameDiagnostic(batch, requested_classes);
+      publishFrameDiagnostic(batch, requested_classes, action_id);
       if (!got_measurement) {
         break;
       }
@@ -556,7 +579,7 @@ private:
             return false;
           });
       if (!has_input || goal_handle->is_canceling()) {
-        batch->stamp = this->now().to_msg();
+        batch->stamp = this->now();
         if (goal_handle->is_canceling()) {
           batch->status = "canceled";
           batch->reason = "action canceled while waiting for input";
@@ -955,7 +978,8 @@ private:
 
   void publishFrameDiagnostic(
       const MeasurementBatch &batch,
-      const std::vector<std::string> &requested_classes) const {
+      const std::vector<std::string> &requested_classes,
+      const std::string &action_id) const {
     diagnostic_msgs::msg::DiagnosticArray array;
     array.header.stamp = batch.stamp;
     array.header.frame_id = map_frame_;
@@ -984,6 +1008,7 @@ private:
     };
     add_value("status", batch.status);
     add_value("reason", batch.reason);
+    add_value("action_id", action_id);
     std::ostringstream class_names;
     for (std::size_t i = 0; i < requested_classes.size(); ++i) {
       if (i > 0) class_names << "|";

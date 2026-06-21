@@ -37,10 +37,11 @@ do not block the `local_search` action node. It is started by
 
 ```text
 /home/nvidia/inha_log/module/local_search/
-  frames.csv
-  images/<stamp>_mask.png
-  images/<stamp>_projected.png
-  pointclouds/<stamp>_matched.pcd
+  action_20260622_153045_123_KST/
+    frames.csv
+    images/<stamp>_mask.png
+    images/<stamp>_projected.png
+    pointclouds/<stamp>_matched.pcd
 ```
 
 The projected image overlays the LiDAR points that passed the prefilter, bbox,

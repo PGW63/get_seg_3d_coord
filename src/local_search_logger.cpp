@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -154,27 +155,7 @@ private:
 
   void initializeOutput() {
     try {
-      std::filesystem::create_directories(
-          std::filesystem::path(output_dir_) / "images");
-      std::filesystem::create_directories(
-          std::filesystem::path(output_dir_) / "pointclouds");
-      const auto csv_path = std::filesystem::path(output_dir_) / "frames.csv";
-      const bool write_header =
-          !std::filesystem::exists(csv_path) ||
-          std::filesystem::file_size(csv_path) == 0;
-      csv_.open(csv_path, std::ios::out | std::ios::app);
-      if (!csv_.is_open()) {
-        throw std::runtime_error("cannot open " + csv_path.string());
-      }
-      if (write_header) {
-        csv_ << "stamp_ns,status,reason,requested_classes,"
-                "requested_class_names,matched_classes,bbox_candidates,"
-                "raw_points,finite_points,prefiltered_points,"
-                "camera_front_points,bbox_points,matched_points,clusters,"
-                "mask_file,projected_file,cloud_file,projected_points,"
-                "artifact_error\n";
-        csv_.flush();
-      }
+      std::filesystem::create_directories(output_dir_);
     } catch (const std::exception &ex) {
       RCLCPP_FATAL(this->get_logger(), "Cannot initialize log output: %s",
                    ex.what());
@@ -234,12 +215,10 @@ private:
         const auto mask_it = mask_cache_.find(it->first);
         if (mask_it != mask_cache_.end()) {
           item.mask = mask_it->second;
-          mask_cache_.erase(mask_it);
         }
         const auto cloud_it = cloud_cache_.find(it->first);
         if (cloud_it != cloud_cache_.end()) {
           item.cloud = cloud_it->second;
-          cloud_cache_.erase(cloud_it);
         }
         item.camera_info = camera_info_;
         work.push_back(std::move(item));
@@ -269,6 +248,19 @@ private:
                              const std::string &fallback = "") {
     const auto it = values.find(key);
     return it == values.end() ? fallback : it->second;
+  }
+
+  static std::string sanitizePathComponent(const std::string &value) {
+    std::string sanitized;
+    sanitized.reserve(value.size());
+    for (const unsigned char ch : value) {
+      if (std::isalnum(ch) || ch == '-' || ch == '_') {
+        sanitized.push_back(static_cast<char>(ch));
+      } else {
+        sanitized.push_back('_');
+      }
+    }
+    return sanitized.empty() ? "unknown_action" : sanitized;
   }
 
   std::size_t projectCloud(const PointCloud2 &cloud,
@@ -329,6 +321,18 @@ private:
   void saveFrame(const FrameWork &work) {
     const auto &stamp = work.diagnostic->header.stamp;
     const auto values = diagnosticValues(*work.diagnostic);
+    const std::string action_id = sanitizePathComponent(
+        valueOr(values, "action_id", "unknown_action"));
+    const auto action_dir = std::filesystem::path(output_dir_) / action_id;
+    try {
+      std::filesystem::create_directories(action_dir / "images");
+      std::filesystem::create_directories(action_dir / "pointclouds");
+    } catch (const std::exception &ex) {
+      RCLCPP_ERROR(this->get_logger(),
+                   "Cannot create output directory for %s: %s",
+                   action_id.c_str(), ex.what());
+      return;
+    }
     const std::string stem = stampFileStem(stamp);
     const std::string mask_relative = "images/" + stem + "_mask.png";
     const std::string projected_relative =
@@ -355,8 +359,7 @@ private:
       if (mask.empty()) {
         throw std::runtime_error("decoded mask is empty");
       }
-      if (!cv::imwrite((std::filesystem::path(output_dir_) / mask_relative).string(),
-                       mask)) {
+      if (!cv::imwrite((action_dir / mask_relative).string(), mask)) {
         throw std::runtime_error("failed to write mask image");
       }
       mask_file = mask_relative;
@@ -376,7 +379,7 @@ private:
       try {
         pcl::PointCloud<pcl::PointXYZ> points;
         pcl::fromROSMsg(*work.cloud, points);
-        const auto path = std::filesystem::path(output_dir_) / cloud_relative;
+        const auto path = action_dir / cloud_relative;
         if (pcl::io::savePCDFileBinary(path.string(), points) != 0) {
           throw std::runtime_error("failed to write matched point cloud");
         }
@@ -410,9 +413,7 @@ private:
         cv::putText(overlay, label, cv::Point(12, 28),
                     cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(255, 255, 255),
                     1, cv::LINE_AA);
-        if (!cv::imwrite(
-                (std::filesystem::path(output_dir_) / projected_relative).string(),
-                overlay)) {
+        if (!cv::imwrite((action_dir / projected_relative).string(), overlay)) {
           throw std::runtime_error("failed to write projected image");
         }
         projected_file = projected_relative;
@@ -425,24 +426,44 @@ private:
       }
     }
 
-    csv_ << stampNanoseconds(stamp) << ","
-         << csvEscape(valueOr(values, "status", "unknown")) << ","
-         << csvEscape(valueOr(values, "reason")) << ","
-         << valueOr(values, "requested_classes", "0") << ","
-         << csvEscape(valueOr(values, "requested_class_names")) << ","
-         << valueOr(values, "matched_classes", "0") << ","
-         << valueOr(values, "bbox_candidates", "0") << ","
-         << valueOr(values, "raw_points", "0") << ","
-         << valueOr(values, "finite_points", "0") << ","
-         << valueOr(values, "prefiltered_points", "0") << ","
-         << valueOr(values, "camera_front_points", "0") << ","
-         << valueOr(values, "bbox_points", "0") << ","
-         << valueOr(values, "matched_points", "0") << ","
-         << valueOr(values, "clusters", "0") << ","
-         << csvEscape(mask_file) << "," << csvEscape(projected_file) << ","
-         << csvEscape(cloud_file) << "," << projected_points << ","
-         << csvEscape(artifact_error) << "\n";
-    csv_.flush();
+    const auto csv_path = action_dir / "frames.csv";
+    try {
+      const bool write_header =
+          !std::filesystem::exists(csv_path) ||
+          std::filesystem::file_size(csv_path) == 0;
+      std::ofstream csv(csv_path, std::ios::out | std::ios::app);
+      if (!csv.is_open()) {
+        throw std::runtime_error("cannot open " + csv_path.string());
+      }
+      if (write_header) {
+        csv << "action_id,stamp_ns,status,reason,requested_classes,"
+               "requested_class_names,matched_classes,bbox_candidates,"
+               "raw_points,finite_points,prefiltered_points,"
+               "camera_front_points,bbox_points,matched_points,clusters,"
+               "mask_file,projected_file,cloud_file,projected_points,"
+               "artifact_error\n";
+      }
+      csv << csvEscape(action_id) << "," << stampNanoseconds(stamp) << ","
+          << csvEscape(valueOr(values, "status", "unknown")) << ","
+          << csvEscape(valueOr(values, "reason")) << ","
+          << valueOr(values, "requested_classes", "0") << ","
+          << csvEscape(valueOr(values, "requested_class_names")) << ","
+          << valueOr(values, "matched_classes", "0") << ","
+          << valueOr(values, "bbox_candidates", "0") << ","
+          << valueOr(values, "raw_points", "0") << ","
+          << valueOr(values, "finite_points", "0") << ","
+          << valueOr(values, "prefiltered_points", "0") << ","
+          << valueOr(values, "camera_front_points", "0") << ","
+          << valueOr(values, "bbox_points", "0") << ","
+          << valueOr(values, "matched_points", "0") << ","
+          << valueOr(values, "clusters", "0") << ","
+          << csvEscape(mask_file) << "," << csvEscape(projected_file) << ","
+          << csvEscape(cloud_file) << "," << projected_points << ","
+          << csvEscape(artifact_error) << "\n";
+    } catch (const std::exception &ex) {
+      RCLCPP_ERROR(this->get_logger(), "Cannot append %s: %s",
+                   csv_path.c_str(), ex.what());
+    }
 
     if (!artifact_error.empty()) {
       RCLCPP_WARN(this->get_logger(), "Frame %s logged with artifact error: %s",
@@ -462,7 +483,6 @@ private:
   int point_radius_px_{2};
   bool save_matched_cloud_{true};
 
-  std::ofstream csv_;
   std::mutex mutex_;
   std::map<std::int64_t, CompressedImage::ConstSharedPtr> mask_cache_;
   std::map<std::int64_t, PointCloud2::ConstSharedPtr> cloud_cache_;
