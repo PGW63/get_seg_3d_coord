@@ -102,10 +102,10 @@ public:
         std::max(0.0, this->declare_parameter<double>("artifact_wait_sec", 0.5));
     tf_timeout_sec_ =
         std::max(0.0, this->declare_parameter<double>("tf_timeout_sec", 0.2));
-    cache_size_ =
-        std::max(10, this->declare_parameter<int>("cache_size", 100));
-    point_radius_px_ =
-        std::max(1, this->declare_parameter<int>("point_radius_px", 2));
+    cache_size_ = static_cast<int>(std::max<std::int64_t>(
+        10, this->declare_parameter<std::int64_t>("cache_size", 100)));
+    point_radius_px_ = static_cast<int>(std::max<std::int64_t>(
+        1, this->declare_parameter<std::int64_t>("point_radius_px", 2)));
     save_matched_cloud_ =
         this->declare_parameter<bool>("save_matched_cloud", true);
 
