@@ -31,6 +31,7 @@ local_search:
     centers_topic: "~/cluster_centers"
     clustered_cloud_topic: "~/clustered_points"
     markers_topic: "~/cluster_markers"
+    diagnostics_topic: "~/frame_diagnostics"
     action_name: "local_search"
     camera_frame: "camera_head_color_optical_frame"
     map_frame: "map"
@@ -64,3 +65,17 @@ local_search:
     ekf_process_variance_per_sec: 0.0025
     ekf_log_enabled: true
     ekf_log_dir: "EKF_results"
+
+local_search_logger:
+  ros__parameters:
+    mask_topic: "/sam2_segmentation_node/binary_mask/compressed"
+    matched_cloud_topic: "/local_search/points"
+    camera_info_topic: "/camera/camera_head/color/camera_info"
+    diagnostics_topic: "/local_search/frame_diagnostics"
+    camera_frame: "camera_head_color_optical_frame"
+    output_dir: "/home/nvidia/inha_log/module/local_search"
+    artifact_wait_sec: 0.5
+    tf_timeout_sec: 0.2
+    cache_size: 300
+    point_radius_px: 2
+    save_matched_cloud: true

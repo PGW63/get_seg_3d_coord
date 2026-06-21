@@ -44,7 +44,8 @@ bool collectMaskProjectedPoints(
     rclcpp::Clock &clock,
     pcl::PointCloud<pcl::PointXYZ>::Ptr &accumulated_cloud,
     std::vector<int> &per_point_bbox,
-    PointSelectionStats *stats) {
+    PointSelectionStats *stats,
+    std::string *failure_reason) {
   auto input_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
   pcl::fromROSMsg(*cloud_msg, *input_cloud);
   if (stats) {
@@ -58,6 +59,9 @@ bool collectMaskProjectedPoints(
       config.camera_frame.empty() ? camera_info->header.frame_id
                                   : config.camera_frame;
   if (camera_frame.empty()) {
+    if (failure_reason) {
+      *failure_reason = "camera frame is empty";
+    }
     RCLCPP_WARN_THROTTLE(logger, clock, 2000, "Camera frame is empty.");
     return false;
   }
@@ -68,6 +72,11 @@ bool collectMaskProjectedPoints(
         camera_frame, cloud_msg->header.frame_id, projection_stamp,
         rclcpp::Duration::from_seconds(config.tf_timeout_sec));
   } catch (const tf2::TransformException &ex) {
+    if (failure_reason) {
+      *failure_reason = "cannot transform cloud frame '" +
+                        cloud_msg->header.frame_id + "' to camera frame '" +
+                        camera_frame + "': " + ex.what();
+    }
     RCLCPP_WARN_THROTTLE(
         logger, clock, 2000,
         "Cannot transform cloud frame '%s' to camera frame '%s' at mask time: %s",
@@ -88,6 +97,12 @@ bool collectMaskProjectedPoints(
           rclcpp::Duration::from_seconds(config.tf_timeout_sec));
       cloud_to_output = transformToEigen(out_tf.transform);
     } catch (const tf2::TransformException &ex) {
+      if (failure_reason) {
+        *failure_reason = "cannot transform cloud frame '" +
+                          cloud_msg->header.frame_id +
+                          "' to output frame '" + output_frame + "': " +
+                          ex.what();
+      }
       RCLCPP_WARN_THROTTLE(
           logger, clock, 2000,
           "Cannot transform cloud frame '%s' to output frame '%s' at mask time: %s",
@@ -159,6 +174,7 @@ bool collectMaskProjectedPoints(
     if (camera_point.z() <= 0.0F) {
       continue;
     }
+    ++frame_stats.camera_front_points;
 
     const double u_orig = fx * camera_point.x() / camera_point.z() + cx;
     const double v_orig = fy * camera_point.y() / camera_point.z() + cy;
@@ -180,6 +196,7 @@ bool collectMaskProjectedPoints(
     if (best_bbox < 0) {
       continue;
     }
+    ++frame_stats.bbox_points;
 
     const int u_mask = static_cast<int>(std::lround(u_orig * x_scale));
     const int v_mask = static_cast<int>(std::lround(v_orig * y_scale));
@@ -204,14 +221,17 @@ bool collectMaskProjectedPoints(
   if (stats) {
     stats->finite_points += frame_stats.finite_points;
     stats->prefiltered_points += frame_stats.prefiltered_points;
+    stats->camera_front_points += frame_stats.camera_front_points;
+    stats->bbox_points += frame_stats.bbox_points;
     stats->selected_points += frame_stats.selected_points;
   }
 
   RCLCPP_INFO(logger,
               "local_search cloud frame: raw=%zu finite=%zu prefiltered=%zu "
-              "bbox_mask=%zu cumulative=%zu",
+              "camera_front=%zu bbox=%zu bbox_mask=%zu cumulative=%zu",
               frame_stats.raw_points, frame_stats.finite_points,
-              frame_stats.prefiltered_points, frame_stats.selected_points,
+              frame_stats.prefiltered_points, frame_stats.camera_front_points,
+              frame_stats.bbox_points, frame_stats.selected_points,
               accumulated_cloud->points.size());
   return true;
 }

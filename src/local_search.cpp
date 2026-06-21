@@ -21,6 +21,9 @@
 #include <Eigen/Geometry>
 #include <builtin_interfaces/msg/time.hpp>
 #include <cv_bridge/cv_bridge.h>
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include <diagnostic_msgs/msg/diagnostic_status.hpp>
+#include <diagnostic_msgs/msg/key_value.hpp>
 #include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <geometry_msgs/msg/pose.hpp>
@@ -83,6 +86,8 @@ public:
         "clustered_cloud_topic", "~/clustered_points");
     markers_topic_ = this->declare_parameter<std::string>(
         "markers_topic", "~/cluster_markers");
+    diagnostics_topic_ = this->declare_parameter<std::string>(
+        "diagnostics_topic", "~/frame_diagnostics");
     action_name_ =
         this->declare_parameter<std::string>("action_name", "local_search");
     camera_frame_param_ =
@@ -209,6 +214,9 @@ public:
             clustered_cloud_topic_, reliable_qos);
     markers_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
         markers_topic_, reliable_qos);
+    diagnostics_pub_ =
+        this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+            diagnostics_topic_, reliable_qos);
 
     action_server_ = rclcpp_action::create_server<LocalSearch>(
         this, action_name_,
@@ -246,10 +254,16 @@ private:
   using InputSynchronizer = message_filters::Synchronizer<InputSyncPolicy>;
 
   struct MeasurementBatch {
+    builtin_interfaces::msg::Time stamp;
     std::vector<Eigen::Vector3f> positions;
     std::vector<bool> found;
+    PointSelectionStats selection_stats;
+    std::size_t bbox_candidate_count{0};
     std::size_t cluster_count{0};
     std::size_t point_count{0};
+    std::size_t matched_class_count{0};
+    std::string status{"unknown"};
+    std::string reason;
     std::string diagnostics;
   };
 
@@ -333,6 +347,7 @@ private:
       const bool got_measurement = collectMeasurementBatch(
           goal_handle, requested_classes, min_input_stamp, reference,
           effective_max_distance, ekf_deadline, &batch, &min_input_stamp);
+      publishFrameDiagnostic(batch, requested_classes);
       if (!got_measurement) {
         break;
       }
@@ -541,6 +556,42 @@ private:
             return false;
           });
       if (!has_input || goal_handle->is_canceling()) {
+        batch->stamp = this->now().to_msg();
+        if (goal_handle->is_canceling()) {
+          batch->status = "canceled";
+          batch->reason = "action canceled while waiting for input";
+        } else if (!has_synced_input_) {
+          batch->status = "input_timeout";
+          batch->reason = "no synchronized mask and bbox were received";
+        } else if (camera_info_ == nullptr) {
+          batch->stamp = latest_synced_input_.mask_header.stamp;
+          batch->status = "input_timeout";
+          batch->reason = "camera info was not received";
+        } else if (!latest_synced_input_.bbox_msg) {
+          batch->stamp = latest_synced_input_.mask_header.stamp;
+          batch->status = "input_timeout";
+          batch->reason = "synchronized bbox message was empty";
+        } else {
+          batch->stamp = latest_synced_input_.mask_header.stamp;
+          const auto &latest_bbox = latest_synced_input_.bbox_msg;
+          bool has_requested_class = false;
+          for (const auto &det : latest_bbox->detections) {
+            if (det.results.empty()) continue;
+            const auto &class_id = det.results.front().hypothesis.class_id;
+            if (std::find(requested_classes.begin(), requested_classes.end(),
+                          class_id) != requested_classes.end()) {
+              has_requested_class = true;
+              break;
+            }
+          }
+          if (!has_requested_class) {
+            batch->status = "no_requested_bbox";
+            batch->reason = "no bbox for any requested class was received";
+          } else {
+            batch->status = "input_timeout";
+            batch->reason = "no newer synchronized mask and bbox arrived";
+          }
+        }
         return false;
       }
 
@@ -551,12 +602,20 @@ private:
     }
 
     const rclcpp::Time projection_stamp(mask_header.stamp);
+    batch->stamp = mask_header.stamp;
     *next_min_input_stamp = rclcpp::Time(bbox_msg->header.stamp);
     batch->positions.assign(requested_classes.size(), Eigen::Vector3f::Zero());
     batch->found.assign(requested_classes.size(), false);
+    std::string odom_failure_reason;
     if (require_stable_odom_ &&
-        !waitForStableOdom(goal_handle, projection_stamp)) {
+        !waitForStableOdom(goal_handle, projection_stamp,
+                           &odom_failure_reason)) {
       batch->diagnostics = "[unstable odom]";
+      batch->status = "unstable_odom";
+      batch->reason = "odometry was not stable around the mask timestamp";
+      if (!odom_failure_reason.empty()) {
+        batch->reason += ": " + odom_failure_reason;
+      }
       return true;
     }
 
@@ -588,19 +647,27 @@ private:
       }
     }
     if (goal_handle->is_canceling() || !submap_cloud) {
+      batch->status = goal_handle->is_canceling() ? "canceled"
+                                                  : "cloud_timeout";
+      batch->reason = goal_handle->is_canceling()
+                          ? "action canceled while waiting for point cloud"
+                          : "no point cloud newer than collection start arrived "
+                            "before timeout";
       return false;
     }
 
     const auto candidates =
         buildBBoxCandidates(*bbox_msg, requested_classes, *camera_info, mask);
+    batch->bbox_candidate_count = candidates.size();
     auto accumulated_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
     std::vector<int> per_point_bbox;
-    PointSelectionStats selection_stats;
     const PointSelectionConfig selection_config = makePointSelectionConfig();
-    get_seg_3d_coord::collectMaskProjectedPoints(
+    std::string selection_failure_reason;
+    const bool selection_ok = get_seg_3d_coord::collectMaskProjectedPoints(
         submap_cloud, camera_info, mask, candidates, projection_stamp,
         selection_config, tf_buffer_, this->get_logger(), *this->get_clock(),
-        accumulated_cloud, per_point_bbox, &selection_stats);
+        accumulated_cloud, per_point_bbox, &batch->selection_stats,
+        &selection_failure_reason);
     accumulated_cloud->width =
         static_cast<std::uint32_t>(accumulated_cloud->points.size());
     accumulated_cloud->height = 1;
@@ -654,6 +721,7 @@ private:
       if (best) {
         batch->positions[i] = best->center_map;
         batch->found[i] = true;
+        ++batch->matched_class_count;
       } else {
         char dbuf[128];
         if (matching_class_clusters == 0) {
@@ -667,6 +735,45 @@ private:
         }
         batch->diagnostics += dbuf;
       }
+    }
+
+    if (!selection_ok) {
+      batch->status = "projection_failed";
+      batch->reason = selection_failure_reason.empty()
+                          ? "point projection failed"
+                          : selection_failure_reason;
+    } else if (candidates.empty()) {
+      batch->status = "no_bbox_candidate";
+      batch->reason = "no valid bbox matched the requested classes";
+    } else if (batch->selection_stats.selected_points == 0) {
+      batch->status = "no_matching_lidar";
+      if (batch->selection_stats.raw_points == 0) {
+        batch->reason = "input point cloud was empty";
+      } else if (batch->selection_stats.finite_points == 0) {
+        batch->reason = "input point cloud had no finite points";
+      } else if (batch->selection_stats.prefiltered_points == 0) {
+        batch->reason = "no LiDAR point passed the spatial prefilter";
+      } else if (batch->selection_stats.camera_front_points == 0) {
+        batch->reason = "no prefiltered LiDAR point was in front of the camera";
+      } else if (batch->selection_stats.bbox_points == 0) {
+        batch->reason = "no projected LiDAR point landed inside a target bbox";
+      } else {
+        batch->reason = "bbox LiDAR points did not overlap the segmentation mask";
+      }
+    } else if (clusters.empty()) {
+      batch->status = "no_cluster";
+      batch->reason = "matched LiDAR points did not form a valid cluster";
+    } else if (batch->matched_class_count == requested_classes.size()) {
+      batch->status = "ok";
+      batch->reason = "all requested classes matched";
+    } else if (batch->matched_class_count > 0) {
+      batch->status = "partial_match";
+      batch->reason = batch->diagnostics;
+    } else {
+      batch->status = "no_target_cluster";
+      batch->reason = batch->diagnostics.empty()
+                          ? "no cluster matched the requested classes"
+                          : batch->diagnostics;
     }
 
     return true;
@@ -763,7 +870,8 @@ private:
   }
 
   bool waitForStableOdom(const std::shared_ptr<GoalHandle> &goal_handle,
-                         const rclcpp::Time &stamp) {
+                         const rclcpp::Time &stamp,
+                         std::string *failure_reason) {
     std::unique_lock<std::mutex> lock(data_mutex_);
     const auto deadline =
         std::chrono::steady_clock::now() +
@@ -780,6 +888,9 @@ private:
                             "Waiting stable odom near mask stamp: %s",
                             reason.c_str());
       if (data_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+        if (failure_reason) {
+          *failure_reason = reason;
+        }
         RCLCPP_WARN(this->get_logger(),
                     "Odom was not stable around mask stamp within %.2fs: %s",
                     odom_stable_timeout_sec_, reason.c_str());
@@ -840,6 +951,64 @@ private:
     cv::Mat binary;
     cv::threshold(gray_u8, binary, mask_threshold_, 255, cv::THRESH_BINARY);
     return binary;
+  }
+
+  void publishFrameDiagnostic(
+      const MeasurementBatch &batch,
+      const std::vector<std::string> &requested_classes) const {
+    diagnostic_msgs::msg::DiagnosticArray array;
+    array.header.stamp = batch.stamp;
+    array.header.frame_id = map_frame_;
+
+    diagnostic_msgs::msg::DiagnosticStatus status;
+    status.name = "local_search/frame";
+    status.hardware_id = "local_search";
+    status.message = batch.status;
+    if (!batch.reason.empty()) {
+      status.message += ": " + batch.reason;
+    }
+    if (batch.status == "ok") {
+      status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+    } else if (batch.status == "projection_failed") {
+      status.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+    } else {
+      status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+    }
+
+    const auto add_value = [&status](const std::string &key,
+                                     const std::string &value) {
+      diagnostic_msgs::msg::KeyValue item;
+      item.key = key;
+      item.value = value;
+      status.values.push_back(std::move(item));
+    };
+    add_value("status", batch.status);
+    add_value("reason", batch.reason);
+    std::ostringstream class_names;
+    for (std::size_t i = 0; i < requested_classes.size(); ++i) {
+      if (i > 0) class_names << "|";
+      class_names << requested_classes[i];
+    }
+    add_value("requested_classes", std::to_string(requested_classes.size()));
+    add_value("requested_class_names", class_names.str());
+    add_value("matched_classes", std::to_string(batch.matched_class_count));
+    add_value("bbox_candidates", std::to_string(batch.bbox_candidate_count));
+    add_value("raw_points",
+              std::to_string(batch.selection_stats.raw_points));
+    add_value("finite_points",
+              std::to_string(batch.selection_stats.finite_points));
+    add_value("prefiltered_points",
+              std::to_string(batch.selection_stats.prefiltered_points));
+    add_value("camera_front_points",
+              std::to_string(batch.selection_stats.camera_front_points));
+    add_value("bbox_points",
+              std::to_string(batch.selection_stats.bbox_points));
+    add_value("matched_points",
+              std::to_string(batch.selection_stats.selected_points));
+    add_value("clusters", std::to_string(batch.cluster_count));
+    add_value("class_diagnostics", batch.diagnostics);
+    array.status.push_back(std::move(status));
+    diagnostics_pub_->publish(array);
   }
 
   void publishFilteredCloud(
@@ -985,6 +1154,7 @@ private:
   std::string centers_topic_;
   std::string clustered_cloud_topic_;
   std::string markers_topic_;
+  std::string diagnostics_topic_;
   std::string action_name_;
   std::string camera_frame_param_;
   std::string map_frame_;
@@ -1041,6 +1211,8 @@ private:
   rclcpp::Publisher<PointCloud2Msg>::SharedPtr clustered_cloud_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       markers_pub_;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr
+      diagnostics_pub_;
   rclcpp_action::Server<LocalSearch>::SharedPtr action_server_;
 
   tf2_ros::Buffer tf_buffer_;

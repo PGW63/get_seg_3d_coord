@@ -37,6 +37,8 @@ struct PointSelectionStats {
   std::size_t raw_points{0};
   std::size_t finite_points{0};
   std::size_t prefiltered_points{0};
+  std::size_t camera_front_points{0};
+  std::size_t bbox_points{0};
   std::size_t selected_points{0};
 };
 
@@ -52,6 +54,7 @@ bool collectMaskProjectedPoints(
     rclcpp::Clock &clock,
     pcl::PointCloud<pcl::PointXYZ>::Ptr &accumulated_cloud,
     std::vector<int> &per_point_bbox,
-    PointSelectionStats *stats = nullptr);
+    PointSelectionStats *stats = nullptr,
+    std::string *failure_reason = nullptr);
 
 }  // namespace get_seg_3d_coord

@@ -7,6 +7,7 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(cv_bridge REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(message_filters REQUIRED)
@@ -37,6 +38,10 @@ add_executable(local_search
   src/state_odometry.cpp
 )
 
+add_executable(local_search_logger
+  src/local_search_logger.cpp
+)
+
 target_include_directories(table_person_association
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -53,8 +58,17 @@ target_include_directories(local_search
     ${OpenCV_INCLUDE_DIRS}
 )
 
+target_include_directories(local_search_logger
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+    ${PCL_INCLUDE_DIRS}
+    ${OpenCV_INCLUDE_DIRS}
+)
+
 target_compile_features(table_person_association PUBLIC cxx_std_17)
 target_compile_features(local_search PUBLIC cxx_std_17)
+target_compile_features(local_search_logger PUBLIC cxx_std_17)
 
 target_link_libraries(table_person_association
   ${PCL_LIBRARIES}
@@ -68,12 +82,23 @@ target_link_libraries(local_search
   ${OpenCV_LIBS}
 )
 
+target_link_libraries(local_search_logger
+  ${PCL_LIBRARIES}
+  ${PCL_IO_LIBRARIES}
+  ${OpenCV_LIBS}
+)
+
 target_compile_definitions(table_person_association
   PRIVATE
     ${PCL_DEFINITIONS}
 )
 
 target_compile_definitions(local_search
+  PRIVATE
+    ${PCL_DEFINITIONS}
+)
+
+target_compile_definitions(local_search_logger
   PRIVATE
     ${PCL_DEFINITIONS}
 )
@@ -95,6 +120,7 @@ ament_target_dependencies(table_person_association
 
 ament_target_dependencies(local_search
   cv_bridge
+  diagnostic_msgs
   geometry_msgs
   message_filters
   nav_msgs
@@ -110,6 +136,17 @@ ament_target_dependencies(local_search
   inha_interfaces
 )
 
+ament_target_dependencies(local_search_logger
+  cv_bridge
+  diagnostic_msgs
+  geometry_msgs
+  pcl_conversions
+  rclcpp
+  sensor_msgs
+  tf2
+  tf2_ros
+)
+
 target_link_libraries(table_person_association
   ${cpp_typesupport_target}
 )
@@ -122,6 +159,7 @@ install(
   TARGETS
     table_person_association
     local_search
+    local_search_logger
   DESTINATION lib/${PROJECT_NAME}
 )
 
