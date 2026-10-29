@@ -1,181 +1,165 @@
 # get_seg_3d_coord
 
-ROS 2 package for estimating 3D target coordinates from segmentation masks,
-2D detections, recent LiDAR submaps, and odometry.
+**Estimate the 3D position of a detected object by fusing segmentation masks, 2D detections, a LiDAR submap and odometry, then smoothing it with an EKF.**
 
-The main experimental path is `local_search`, which can log raw measurements
-and EKF state so the EKF covariance parameters can be tuned from real runs.
+![ROS 2](https://img.shields.io/badge/ROS%202-Humble-22314E?logo=ros)
+![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus)
 
-## Local Search Summary
+Developed for RoboCup@Home 2026 (team Inha-United) on the RB-Y1 mobile manipulator. The output is the target point a navigation or approach module drives to.
 
-`local_search` expects:
+---
 
-- binary segmentation mask
-- detection bbox stream
-- recent local submap point cloud
-- odometry
-- reference position from the action goal
+## Why
 
-Pipeline:
+A camera tells you *what* the object is, a LiDAR tells you *where* points are. Neither alone gives a stable 3D target:
 
-1. Synchronize mask and bbox.
-2. Reject measurements when odometry is not stable.
+- single-frame depth from a mask is noisy at the edges,
+- raw Livox frames are sparse, so a small object may get only a few points,
+- measurements taken while the robot is turning are smeared by TF/time mismatch.
+
+`local_search` projects a recent LiDAR **submap** into the camera, keeps only points inside both the detection box and the mask, and feeds the selected cluster into a static-position **EKF** that returns once its covariance converges.
+
+## Pipeline
+
+```mermaid
+flowchart LR
+    M[Mask] --> S[Sync mask + bbox]
+    B[BBox stream] --> S
+    O[Odometry] --> G{Odom stable?}
+    S --> G
+    G -- no --> R[Reject frame]
+    G -- yes --> P[Project submap<br/>into camera]
+    C[LiDAR submap] --> P
+    P --> F[Points inside<br/>bbox ∩ mask]
+    F --> K[Euclidean clustering]
+    K --> N[Nearest cluster<br/>to reference]
+    N --> E[Static-position EKF]
+    E --> D{cov < threshold?}
+    D -- yes --> OUT[Return 3D target]
+    D -- no, timeout --> OUT
+```
+
+1. Synchronize the mask and bbox streams (approximate time, 0.2 s slop).
+2. Reject the measurement if the robot's angular velocity over the last 0.3 s exceeds 0.20 rad/s.
 3. Project one recent submap cloud into the camera at the mask timestamp.
-4. Select points inside bbox and mask.
-5. Cluster selected points.
-6. Pick the cluster nearest to the reference position.
-7. Feed the selected 3D measurement into a static-position EKF.
-8. Return when covariance is below threshold or timeout expires.
+4. Keep points inside the bbox and the mask.
+5. Cluster the selected points.
+6. Pick the cluster nearest to the reference position from the action goal (within 1.5 m).
+7. Update the EKF; return when the covariance drops below `ekf_converged_variance` or after `ekf_timeout_sec`.
 
-Set `pointcloud_topic` to the recent submap topic before real experiments.
+## Nodes
 
-## Local Search Frame Logs
+| Executable | Interface | Role |
+|---|---|---|
+| `local_search` | action `local_search` | Main path: mask + bbox + submap + odometry → EKF-filtered 3D target |
+| `local_search_logger` | subscribes to `local_search` points, diagnostics and the mask | Writes per-frame images, point clouds and CSV in a separate process so disk I/O never blocks the action |
+| `table_person_association` | action `associate_cluster` | Earlier variant: mask + raw Livox frames with decay accumulation, clusters for tables and people |
 
-`local_search_logger` runs as a separate process so image encoding and disk I/O
-do not block the `local_search` action node. It is started by
-`segmented_lidar_cluster.launch.py` and writes to:
+### `local_search` topics
 
-```text
-/home/nvidia/inha_log/module/local_search/
-  action_20260622_153045_123_KST/
-    frames.csv
-    images/<stamp>_mask.png
-    images/<stamp>_projected.png
-    pointclouds/<stamp>_matched.pcd
-```
+| Topic | Direction | Default |
+|---|---|---|
+| Mask | in | `/sam2_segmentation_node/binary_mask/compressed` |
+| Detection bbox | in | `/detection/bbox_stream` |
+| LiDAR submap | in | `/approach/submap_cloud` |
+| Camera info | in | `/camera/camera_head/color/camera_info` |
+| Odometry | in | `/odom` |
+| Selected points | out | `~/points` |
+| Cluster centers | out | `~/cluster_centers` |
+| Clustered points | out | `~/clustered_points` |
+| RViz markers | out | `~/cluster_markers` |
+| Frame diagnostics | out | `~/frame_diagnostics` |
 
-The projected image overlays the LiDAR points that passed the prefilter, bbox,
-and segmentation-mask tests. `frames.csv` records the raw, finite, prefiltered,
-camera-front, bbox, and mask-matched point counts; bbox and cluster counts;
-matched class count; status; failure reason; artifact paths; and logger-side
-image/TF/write errors.
+## Requirements
 
-Frame statuses include `ok`, `partial_match`, `input_timeout`, `cloud_timeout`,
-`no_requested_bbox`, `unstable_odom`, `projection_failed`, `no_bbox_candidate`,
-`no_matching_lidar`, `no_cluster`, and `no_target_cluster`.
-
-The output path and logger topics can be changed in `config/params.yaml` under
-`local_search_logger.ros__parameters`.
-
-## EKF Experiment Workflow
-
-The EKF parameters are hard to choose analytically because the measurement
-noise depends on segmentation quality, bbox quality, calibration error, submap
-density, and robot motion. The intended workflow is:
-
-1. Run `local_search` with EKF logging enabled.
-2. Collect multiple CSV logs in `EKF_results/`.
-3. Sweep candidate EKF parameters offline.
-4. Score each parameter set using NIS consistency and pseudo-GT error.
-5. Put the best parameters back into `config/params.yaml`.
-
-### 1. Collect Logs
-
-Enable logging:
-
-```yaml
-ekf_enabled: true
-ekf_log_enabled: true
-ekf_log_dir: "EKF_results"
-```
-
-Each action run writes one CSV file. The log includes:
-
-- measured cluster center: `meas_x`, `meas_y`, `meas_z`
-- EKF estimate before/at update: `est_x`, `est_y`, `est_z`
-- covariance diagonal: `cov_x`, `cov_y`, `cov_z`
-- normalized innovation squared: `nis`
-- parameters used in the run header:
-  - `ekf_initial_variance`
-  - `ekf_measurement_variance`
-  - `ekf_process_variance_per_sec`
-  - `ekf_converged_variance`
-
-`EKF_results/` is ignored by git.
-
-### 2. Tune Parameters
-
-Tune these three values together:
-
-```yaml
-ekf_initial_variance: 1.0          # P0
-ekf_measurement_variance: 0.09     # R
-ekf_process_variance_per_sec: 0.0025 # Q growth
-```
-
-Interpretation:
-
-- Larger `ekf_measurement_variance` trusts each cluster measurement less.
-- Smaller `ekf_measurement_variance` follows measurements more aggressively.
-- Larger `ekf_process_variance_per_sec` lets covariance grow faster over time.
-- Smaller `ekf_process_variance_per_sec` assumes the target is more static.
-- Larger `ekf_initial_variance` makes the first few measurements dominate less.
-
-### 3. Evaluate Without GT
-
-There is no true ground truth in the current setup, so use consistency metrics.
-
-Use NIS:
-
-```text
-NIS = innovation^T * S^-1 * innovation
-```
-
-For a 3D position measurement, reasonable NIS values should usually be near the
-3D chi-square distribution. Very large repeated NIS means the chosen covariance
-is too optimistic or the measurements contain outliers.
-
-Use pseudo-GT MAE:
-
-1. For each run, compute a robust final position from the measurements or EKF
-   estimates, such as median of the last stable samples.
-2. Treat that robust final position as pseudo-GT.
-3. Compute MAE between each EKF estimate and the pseudo-GT.
-
-Good parameters should:
-
-- keep NIS from exploding repeatedly
-- reduce pseudo-GT MAE quickly
-- converge covariance before `ekf_timeout_sec`
-- avoid following single-frame measurement jumps too aggressively
-
-### 4. Apply Best Parameters
-
-After offline tuning, copy the selected values into:
-
-```yaml
-local_search:
-  ros__parameters:
-    ekf_initial_variance: ...
-    ekf_measurement_variance: ...
-    ekf_process_variance_per_sec: ...
-    ekf_converged_variance: ...
-```
-
-Then rerun the same scenarios and compare new logs against previous logs.
-
-## Important Runtime Parameters
-
-```yaml
-pointcloud_topic: "/recent_submap/points"
-submap_timeout_sec: 3.0
-require_stable_odom: true
-odom_stable_window_sec: 0.3
-odom_stable_timeout_sec: 1.0
-max_relative_angular_velocity_rad_s: 0.20
-ekf_enabled: true
-ekf_timeout_sec: 10.0
-ekf_converged_variance: 0.01
-```
-
-`submap_timeout_sec` replaces previous raw LiDAR frame accumulation. The node
-uses one recent submap cloud per measurement update.
+- Ubuntu 22.04, ROS 2 Humble
+- PCL, Eigen3, OpenCV (`cv_bridge`), `message_filters`, `vision_msgs`
+- `inha_interfaces` — the team's action/message package, not included here. It must be in the same workspace.
 
 ## Build
 
-This package depends on `inha_interfaces`. Make sure that package is available
-and sourced before building.
+```bash
+cd ~/robocup_ws/src
+git clone https://github.com/PGW63/get_seg_3d_coord.git
+cd ~/robocup_ws
+rosdep install --from-paths src --ignore-src -r -y
+colcon build --packages-select get_seg_3d_coord --cmake-args -DCMAKE_BUILD_TYPE=Release
+source install/setup.bash
+```
+
+## Run
 
 ```bash
-colcon build --packages-select get_seg_3d_coord
+ros2 launch get_seg_3d_coord segmented_lidar_cluster.launch.py
 ```
+
+Starts `table_person_association`, `local_search` and `local_search_logger` with [`config/params.yaml`](config/params.yaml). Set `pointcloud_topic` to your submap topic before real experiments.
+
+## Key parameters (`local_search`)
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `submap_timeout_sec` | 3.0 | Max age of the submap used for one measurement |
+| `require_stable_odom` | true | Reject measurements while the robot rotates |
+| `max_relative_angular_velocity_rad_s` | 0.20 | Rotation limit for a stable frame |
+| `odom_stable_window_sec` | 0.3 | Window over which stability is checked |
+| `prefilter_{x,y,z}_{min,max}` | 0.5–5.0 / ±2.0 / 0.3–1.5 m | Box in `base` frame applied before projection |
+| `cluster_tolerance` | 0.30 m | Euclidean clustering distance |
+| `max_distance_from_reference_m` | 1.5 | Gate around the goal's reference position |
+| `ekf_initial_variance` (P0) | 1.0 | Initial uncertainty |
+| `ekf_measurement_variance` (R) | 0.09 | Trust in one cluster measurement |
+| `ekf_process_variance_per_sec` (Q) | 0.0025 | Covariance growth over time |
+| `ekf_converged_variance` | 0.01 | Return threshold |
+| `ekf_timeout_sec` | 10.0 | Give up and return the current estimate |
+
+## Tuning the EKF without ground truth
+
+Measurement noise depends on segmentation quality, calibration, submap density and robot motion, so R and Q cannot be set analytically. The package logs every run and the parameters are swept offline:
+
+- **NIS consistency** — normalized innovation squared should follow a χ² distribution with 3 degrees of freedom.
+- **Pseudo-GT MAE** — the median of the last stable samples is used as a pseudo ground truth.
+
+Full workflow: [docs/ekf_tuning.md](docs/ekf_tuning.md).
+
+## Diagnostics
+
+Every frame is logged with a status so failures can be counted, not guessed:
+
+`ok` · `partial_match` · `input_timeout` · `cloud_timeout` · `no_requested_bbox` · `unstable_odom` · `projection_failed` · `no_bbox_candidate` · `no_matching_lidar` · `no_cluster` · `no_target_cluster`
+
+Log layout and CSV columns: [docs/logging.md](docs/logging.md).
+
+## Repository layout
+
+```text
+get_seg_3d_coord/
+├── config/params.yaml            # parameters for all three nodes
+├── docs/
+│   ├── ekf_tuning.md             # offline EKF parameter sweep
+│   └── logging.md                # frame logs and CSV columns
+├── include/get_seg_3d_coord/
+│   ├── cluster_extractor.hpp     # Euclidean clustering
+│   ├── local_search_types.hpp
+│   ├── point_selector.hpp        # projection + bbox/mask selection
+│   ├── position_ekf.hpp          # static-position EKF
+│   └── state_odometry.hpp        # odometry buffer and stability check
+├── launch/segmented_lidar_cluster.launch.py
+└── src/
+    ├── local_search.cpp          # main action server
+    ├── local_search_logger.cpp   # out-of-process logger
+    ├── table_person_association.cpp
+    └── ...                       # implementations of the headers above
+```
+
+## Limitations
+
+- The target is assumed static during a search.
+- Accuracy against measured ground truth has not been reported yet. `TODO`
+
+## Related
+
+- [approach](https://github.com/PGW63/approach) — picks a manipulation-ready pose around this target.
+
+## Author
+
+Gunwoo Park ([@PGW63](https://github.com/PGW63)) — Inha University, Smart Mobility Engineering
