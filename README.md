@@ -2,7 +2,7 @@
 
 **Estimate the 3D position of a detected object by fusing segmentation masks, 2D detections, a LiDAR submap and odometry, then smoothing it with an EKF.**
 
-![ROS 2](https://img.shields.io/badge/ROS%202-Humble-22314E?logo=ros)
+![ROS 2](https://img.shields.io/badge/ROS%202-22314E?logo=ros)
 ![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus)
 
 Developed for RoboCup@Home 2026 (team Inha-United) on the RB-Y1 mobile manipulator. The output is the target point a navigation or approach module drives to.
@@ -72,7 +72,7 @@ flowchart LR
 
 ## Requirements
 
-- Ubuntu 22.04, ROS 2 Humble
+- ROS 2 (developed on the robot's Jetson; distro: `TODO`)
 - PCL, Eigen3, OpenCV (`cv_bridge`), `message_filters`, `vision_msgs`
 - `inha_interfaces` — the team's action/message package, not included here. It must be in the same workspace.
 
